@@ -10506,6 +10506,96 @@ static int wpa_supplicant_ctrl_iface_mka_del_key(
 	ieee802_1x_kay_delete_mka(wpa_s->kay, &ckn);
 	return 0;
 }
+
+
+static int wpa_supplicant_ctrl_iface_mka_update_key(
+	struct wpa_supplicant *wpa_s, const char *cmd)
+{
+	struct mka_key *cak = NULL;
+	struct mka_key_name *ckn = NULL;
+	struct mka_key_name old_ckn;
+	const char *pos, *end;
+	size_t len;
+	int ret = -1;
+
+	if (!wpa_s->kay) {
+		wpa_printf(MSG_ERROR, "MKA_UPDATE_KEY: KaY not initialized");
+		return -1;
+	}
+
+	/* Parse old_ckn — the CKN of the participant to replace */
+	pos = os_strstr(cmd, "old_ckn=");
+	if (!pos) {
+		wpa_printf(MSG_ERROR, "MKA_UPDATE_KEY: missing old_ckn=");
+		return -1;
+	}
+	pos += 8;
+	end = os_strchr(pos, ' ');
+	len = end ? (size_t) (end - pos) : os_strlen(pos);
+	if (len > 2 * MACSEC_CKN_MAX_LEN || len < 2 || len % 2 != 0) {
+		wpa_printf(MSG_ERROR, "MKA_UPDATE_KEY: invalid old_ckn length");
+		return -1;
+	}
+	old_ckn.len = len / 2;
+	if (hexstr2bin(pos, old_ckn.name, old_ckn.len)) {
+		wpa_printf(MSG_ERROR, "MKA_UPDATE_KEY: invalid old_ckn hex");
+		return -1;
+	}
+
+	/* Parse new cak and ckn */
+	cak = os_zalloc(sizeof(*cak));
+	ckn = os_zalloc(sizeof(*ckn));
+	if (!cak || !ckn)
+		goto done;
+
+	pos = os_strstr(cmd, "cak=");
+	if (!pos) {
+		wpa_printf(MSG_ERROR, "MKA_UPDATE_KEY: missing cak=");
+		goto done;
+	}
+	pos += 4;
+	end = os_strchr(pos, ' ');
+	len = end ? (size_t) (end - pos) : os_strlen(pos);
+	if (len > 2 * MACSEC_CAK_MAX_LEN || len % 2 != 0 ||
+	    (len != 2 * 16 && len != 2 * 32)) {
+		wpa_printf(MSG_ERROR, "MKA_UPDATE_KEY: invalid cak length");
+		goto done;
+	}
+	cak->len = len / 2;
+	if (hexstr2bin(pos, cak->key, cak->len)) {
+		wpa_printf(MSG_ERROR, "MKA_UPDATE_KEY: invalid cak hex");
+		goto done;
+	}
+
+	pos = os_strstr(cmd, "ckn=");
+	if (!pos) {
+		wpa_printf(MSG_ERROR, "MKA_UPDATE_KEY: missing ckn=");
+		goto done;
+	}
+	pos += 4;
+	end = os_strchr(pos, ' ');
+	len = end ? (size_t) (end - pos) : os_strlen(pos);
+	if (len > 2 * MACSEC_CKN_MAX_LEN || len < 2 || len % 2 != 0) {
+		wpa_printf(MSG_ERROR, "MKA_UPDATE_KEY: invalid ckn length");
+		goto done;
+	}
+	ckn->len = len / 2;
+	if (hexstr2bin(pos, ckn->name, ckn->len)) {
+		wpa_printf(MSG_ERROR, "MKA_UPDATE_KEY: invalid ckn hex");
+		goto done;
+	}
+
+	/* Delete old participant, then create new one */
+	ieee802_1x_kay_delete_mka(wpa_s->kay, &old_ckn);
+
+	if (ieee802_1x_kay_create_mka(wpa_s->kay, ckn, cak, 0, PSK, false))
+		ret = 0;
+
+done:
+	os_free(cak);
+	os_free(ckn);
+	return ret;
+}
 #endif /* CONFIG_MACSEC */
 
 
@@ -10584,6 +10674,9 @@ char * wpa_supplicant_ctrl_iface_process(struct wpa_supplicant *wpa_s,
 			reply_len = -1;
 	} else if (os_strncmp(buf, "MKA_DEL_KEY ", 12) == 0) {
 		if (wpa_supplicant_ctrl_iface_mka_del_key(wpa_s, buf + 12))
+			reply_len = -1;
+	} else if (os_strncmp(buf, "MKA_UPDATE_KEY ", 15) == 0) {
+		if (wpa_supplicant_ctrl_iface_mka_update_key(wpa_s, buf + 15))
 			reply_len = -1;
 #endif /* CONFIG_MACSEC */
 	} else if (os_strcmp(buf, "PMKSA") == 0) {
