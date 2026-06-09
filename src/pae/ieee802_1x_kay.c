@@ -4287,6 +4287,12 @@ ieee802_1x_kay_create_mka(struct ieee802_1x_kay *kay,
 	if (!participant->txsc)
 		goto fail;
 	if (ieee802_1x_kay_get_installed_participant(kay)) {
+		if (kay->max_sa_per_sc < 4) {
+			wpa_printf(MSG_ERROR,
+				   "KaY: PSK rollover requires 4 ANs per SC for SAK rotation headroom, hardware supports %u",
+				   kay->max_sa_per_sc);
+			goto fail;
+		}
 		participant->secy_installed = false;
 		wpa_printf(MSG_DEBUG,
 			   "KaY: Standby participant sharing installed SecY");

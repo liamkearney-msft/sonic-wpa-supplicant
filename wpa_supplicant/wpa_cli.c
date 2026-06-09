@@ -351,6 +351,26 @@ static int wpa_cli_cmd_mka_del_key(struct wpa_ctrl *ctrl, int argc,
 
 	return wpa_ctrl_command(ctrl, cmd);
 }
+
+
+static int wpa_cli_cmd_mka_update_key(struct wpa_ctrl *ctrl, int argc,
+				      char *argv[])
+{
+	char cmd[512];
+	int res;
+
+	if (argc < 3) {
+		printf("Usage: mka_update_key old_ckn=<hex> cak=<hex> ckn=<hex>\n");
+		return -1;
+	}
+
+	res = os_snprintf(cmd, sizeof(cmd), "MKA_UPDATE_KEY %s %s %s",
+			  argv[0], argv[1], argv[2]);
+	if (os_snprintf_error(sizeof(cmd), res))
+		return -1;
+
+	return wpa_ctrl_command(ctrl, cmd);
+}
 #endif /* CONFIG_MACSEC */
 
 
@@ -3688,6 +3708,9 @@ static const struct wpa_cli_cmd wpa_cli_commands[] = {
 	{ "mka_del_key", wpa_cli_cmd_mka_del_key, NULL,
 	  cli_cmd_flag_none,
 	  "ckn=<hex> = delete an MKA key by CKN" },
+	{ "mka_update_key", wpa_cli_cmd_mka_update_key, NULL,
+	  cli_cmd_flag_sensitive,
+	  "old_ckn=<hex> cak=<hex> ckn=<hex> = replace an MKA key (atomic delete + add)" },
 #endif /* CONFIG_MACSEC */
 	{ "vendor_elem_add", wpa_cli_cmd_vendor_elem_add, NULL,
 	  cli_cmd_flag_none,
