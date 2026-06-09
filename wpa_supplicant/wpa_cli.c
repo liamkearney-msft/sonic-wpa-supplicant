@@ -312,6 +312,45 @@ static int wpa_cli_cmd_macsec(struct wpa_ctrl *ctrl, int argc, char *argv[])
 		return wpa_ctrl_command(ctrl, "MACSEC-VERBOSE");
 	return wpa_ctrl_command(ctrl, "MACSEC");
 }
+
+
+static int wpa_cli_cmd_mka_add_key(struct wpa_ctrl *ctrl, int argc,
+				   char *argv[])
+{
+	char cmd[512];
+	int res;
+
+	if (argc < 2) {
+		printf("Usage: mka_add_key cak=<hex> ckn=<hex>\n");
+		return -1;
+	}
+
+	res = os_snprintf(cmd, sizeof(cmd), "MKA_ADD_KEY %s %s",
+			  argv[0], argv[1]);
+	if (os_snprintf_error(sizeof(cmd), res))
+		return -1;
+
+	return wpa_ctrl_command(ctrl, cmd);
+}
+
+
+static int wpa_cli_cmd_mka_del_key(struct wpa_ctrl *ctrl, int argc,
+				   char *argv[])
+{
+	char cmd[256];
+	int res;
+
+	if (argc < 1) {
+		printf("Usage: mka_del_key ckn=<hex>\n");
+		return -1;
+	}
+
+	res = os_snprintf(cmd, sizeof(cmd), "MKA_DEL_KEY %s", argv[0]);
+	if (os_snprintf_error(sizeof(cmd), res))
+		return -1;
+
+	return wpa_ctrl_command(ctrl, cmd);
+}
 #endif /* CONFIG_MACSEC */
 
 
@@ -1485,6 +1524,8 @@ static const char *network_fields[] = {
 	"macsec_replay_window",
 	"macsec_port",
 	"mka_priority",
+	"mka_cak2",
+	"mka_ckn2",
 #endif /* CONFIG_MACSEC */
 #ifdef CONFIG_HS20
 	"update_identifier",
@@ -3641,6 +3682,12 @@ static const struct wpa_cli_cmd wpa_cli_commands[] = {
 	{ "macsec", wpa_cli_cmd_macsec, NULL,
 	  cli_cmd_flag_none,
 	  "[verbose] = get current MACsec status" },
+	{ "mka_add_key", wpa_cli_cmd_mka_add_key, NULL,
+	  cli_cmd_flag_sensitive,
+	  "cak=<hex> ckn=<hex> = add a new MKA key for rollover" },
+	{ "mka_del_key", wpa_cli_cmd_mka_del_key, NULL,
+	  cli_cmd_flag_none,
+	  "ckn=<hex> = delete an MKA key by CKN" },
 #endif /* CONFIG_MACSEC */
 	{ "vendor_elem_add", wpa_cli_cmd_vendor_elem_add, NULL,
 	  cli_cmd_flag_none,

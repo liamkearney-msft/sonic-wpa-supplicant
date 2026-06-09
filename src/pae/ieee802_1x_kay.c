@@ -539,6 +539,9 @@ ieee802_1x_kay_init_receive_sa(struct receive_sc *psc, u8 an, u32 lowest_pn,
 
 
 static void ieee802_1x_kay_deinit_data_key(struct data_key *pkey);
+static bool
+ieee802_1x_kay_is_shared_receive_sc(struct ieee802_1x_mka_participant *participant,
+				    const struct receive_sc *psc);
 
 /**
  * ieee802_1x_kay_deinit_receive_sa -
@@ -609,7 +612,8 @@ ieee802_1x_kay_deinit_receive_sc(
 		ieee802_1x_delete_receive_sa(participant->kay, psa);
 
 	dl_list_del(&psc->list);
-	secy_delete_receive_sc(participant->kay, psc);
+	if (!ieee802_1x_kay_is_shared_receive_sc(participant, psc))
+		secy_delete_receive_sc(participant->kay, psc);
 	os_free(psc);
 }
 
@@ -642,6 +646,103 @@ ieee802_1x_kay_create_peer(const u8 *mi, u32 mn)
 }
 
 
+static struct ieee802_1x_mka_participant *
+ieee802_1x_kay_get_installed_participant(struct ieee802_1x_kay *kay)
+{
+	struct ieee802_1x_mka_participant *participant;
+
+	dl_list_for_each(participant, &kay->participant_list,
+			 struct ieee802_1x_mka_participant, list) {
+		if (participant->secy_installed)
+			return participant;
+	}
+
+	return NULL;
+}
+
+
+static void
+ieee802_1x_kay_insert_receive_sc(struct ieee802_1x_mka_participant *participant,
+				 struct receive_sc *new_rxsc)
+{
+	struct receive_sc *rxsc;
+	bool found = false;
+
+	/* Keep rxsc_list sorted by SCI */
+	dl_list_for_each(rxsc, &participant->rxsc_list, struct receive_sc, list) {
+		if (os_memcmp(&new_rxsc->sci, &rxsc->sci,
+			      sizeof(struct ieee802_1x_mka_sci)) > 0) {
+			dl_list_add(&rxsc->list, &new_rxsc->list);
+			found = true;
+			break;
+		}
+	}
+	if (!found)
+		dl_list_add(&participant->rxsc_list, &new_rxsc->list);
+}
+
+
+static bool
+ieee802_1x_kay_is_shared_receive_sc(struct ieee802_1x_mka_participant *participant,
+				    const struct receive_sc *psc)
+{
+	struct ieee802_1x_mka_participant *other;
+	struct receive_sc *rxsc;
+
+	dl_list_for_each(other, &participant->kay->participant_list,
+			 struct ieee802_1x_mka_participant, list) {
+		if (other == participant)
+			continue;
+		dl_list_for_each(rxsc, &other->rxsc_list, struct receive_sc, list) {
+			if (sci_equal(&rxsc->sci, &psc->sci))
+				return true;
+		}
+	}
+
+	return false;
+}
+
+
+static struct receive_sc *
+ieee802_1x_kay_create_peer_rxsc(struct ieee802_1x_mka_participant *participant,
+				const struct ieee802_1x_mka_sci *sci)
+{
+	struct ieee802_1x_mka_participant *other;
+	struct receive_sc *rxsc, *new_rxsc;
+	bool shared = false;
+
+	dl_list_for_each(other, &participant->kay->participant_list,
+			 struct ieee802_1x_mka_participant, list) {
+		if (other == participant)
+			continue;
+		dl_list_for_each(rxsc, &other->rxsc_list, struct receive_sc, list) {
+			if (sci_equal(&rxsc->sci, sci)) {
+				shared = true;
+				break;
+			}
+		}
+		if (shared)
+			break;
+	}
+
+	new_rxsc = ieee802_1x_kay_init_receive_sc(sci);
+	if (!new_rxsc)
+		return NULL;
+
+	if (shared) {
+		wpa_printf(MSG_DEBUG, "KaY: Reusing existing RxSC for peer");
+		return new_rxsc;
+	}
+
+	if (secy_create_receive_sc(participant->kay, new_rxsc)) {
+		os_free(new_rxsc);
+		return NULL;
+	}
+
+	return new_rxsc;
+}
+
+
 /**
  * ieee802_1x_kay_create_live_peer
  */
@@ -650,9 +751,7 @@ ieee802_1x_kay_create_live_peer(struct ieee802_1x_mka_participant *participant,
 				const u8 *mi, u32 mn)
 {
 	struct ieee802_1x_kay_peer *peer;
-	struct receive_sc *rxsc;
 	struct receive_sc *new_rxsc;
-	bool found = false;
 
 	peer = ieee802_1x_kay_create_peer(mi, mn);
 	if (!peer)
@@ -661,31 +760,14 @@ ieee802_1x_kay_create_live_peer(struct ieee802_1x_mka_participant *participant,
 	os_memcpy(&peer->sci, &participant->current_peer_sci,
 		  sizeof(peer->sci));
 
-	new_rxsc = ieee802_1x_kay_init_receive_sc(&peer->sci);
+	new_rxsc = ieee802_1x_kay_create_peer_rxsc(participant, &peer->sci);
 	if (!new_rxsc) {
 		os_free(peer);
 		return NULL;
 	}
 
-	if (secy_create_receive_sc(participant->kay, new_rxsc)) {
-		os_free(new_rxsc);
-		os_free(peer);
-		return NULL;
-	}
 	dl_list_add(&participant->live_peers, &peer->list);
-	/* Keep rxsc_list sorted by SCI */
-	dl_list_for_each(rxsc, &participant->rxsc_list, struct receive_sc,
-			 list) {
-		if (os_memcmp(&new_rxsc->sci, &rxsc->sci,
-			      sizeof(struct ieee802_1x_mka_sci)) > 0) {
-			dl_list_add(&rxsc->list, &new_rxsc->list);
-			found = true;
-			break;
-		}
-	}
-	if (!found) {
-		dl_list_add(&participant->rxsc_list, &new_rxsc->list);
-	}
+	ieee802_1x_kay_insert_receive_sc(participant, new_rxsc);
 
 	wpa_printf(MSG_DEBUG, "KaY: Live peer created");
 	ieee802_1x_kay_dump_peer(peer);
@@ -724,15 +806,14 @@ ieee802_1x_kay_move_live_peer(struct ieee802_1x_mka_participant *participant,
 			      u8 *mi, u32 mn)
 {
 	struct ieee802_1x_kay_peer *peer;
-	struct receive_sc *rxsc;
 	struct receive_sc *new_rxsc;
-	bool found = false;
 
 	peer = ieee802_1x_kay_get_potential_peer(participant, mi);
 	if (!peer)
 		return NULL;
 
-	new_rxsc = ieee802_1x_kay_init_receive_sc(&participant->current_peer_sci);
+	new_rxsc = ieee802_1x_kay_create_peer_rxsc(
+		participant, &participant->current_peer_sci);
 	if (!new_rxsc)
 		return NULL;
 
@@ -745,27 +826,8 @@ ieee802_1x_kay_move_live_peer(struct ieee802_1x_mka_participant *participant,
 	ieee802_1x_kay_dump_peer(peer);
 
 	dl_list_del(&peer->list);
-	if (secy_create_receive_sc(participant->kay, new_rxsc)) {
-		wpa_printf(MSG_ERROR, "KaY: Can't create SC, discard peer");
-		os_free(new_rxsc);
-		os_free(peer);
-		return NULL;
-	}
 	dl_list_add_tail(&participant->live_peers, &peer->list);
-
-	/* Keep rxsc_list sorted by SCI */
-	dl_list_for_each(rxsc, &participant->rxsc_list, struct receive_sc,
-			 list) {
-		if (os_memcmp(&new_rxsc->sci, &rxsc->sci,
-			      sizeof(struct ieee802_1x_mka_sci)) > 0) {
-			dl_list_add(&rxsc->list, &new_rxsc->list);
-			found = true;
-			break;
-		}
-	}
-	if (!found) {
-		dl_list_add(&participant->rxsc_list, &new_rxsc->list);
-	}
+	ieee802_1x_kay_insert_receive_sc(participant, new_rxsc);
 
 	return peer;
 }
@@ -1464,8 +1526,10 @@ ieee802_1x_mka_decode_sak_use_body(
 	struct ieee802_1x_kay *kay = participant->kay;
 	u32 olpn, llpn;
 
-	if (!participant->principal) {
-		wpa_printf(MSG_WARNING, "KaY: Participant is not principal");
+	if (!participant->principal &&
+	    dl_list_empty(&participant->live_peers)) {
+		wpa_printf(MSG_WARNING,
+			   "KaY: Participant is not principal and has no live peers");
 		return -1;
 	}
 	peer = ieee802_1x_kay_get_live_peer(participant,
@@ -1609,10 +1673,12 @@ ieee802_1x_mka_decode_sak_use_body(
 		}
 		if (all_receiving) {
 			participant->to_dist_sak = false;
-			ieee802_1x_cp_set_allreceiving(kay->cp, true);
-			ieee802_1x_cp_sm_step(kay->cp);
+			if (participant->secy_installed) {
+				ieee802_1x_cp_set_allreceiving(kay->cp, true);
+				ieee802_1x_cp_sm_step(kay->cp);
+			}
 		}
-	} else if (peer->is_key_server) {
+	} else if (peer->is_key_server && participant->secy_installed) {
 		if (body->ltx) {
 			ieee802_1x_cp_set_servertransmitting(kay->cp, true);
 			ieee802_1x_cp_sm_step(kay->cp);
@@ -1810,9 +1876,10 @@ ieee802_1x_mka_decode_dist_sak_body(
 		return -1;
 	}
 
-	if (!participant->principal) {
+	if (!participant->principal &&
+	    dl_list_empty(&participant->live_peers)) {
 		wpa_printf(MSG_ERROR,
-			   "KaY: I can't accept the distributed SAK as I am not principal");
+			   "KaY: I can't accept the distributed SAK - not principal and no live peers");
 		return -1;
 	}
 	if (participant->is_key_server) {
@@ -1840,23 +1907,27 @@ ieee802_1x_mka_decode_dist_sak_body(
 	}
 
 	if (body_len == 0) {
-		kay->authenticated = true;
-		kay->secured = false;
-		kay->failed = false;
 		participant->advised_desired = false;
-		ieee802_1x_cp_connect_authenticated(kay->cp);
-		ieee802_1x_cp_sm_step(kay->cp);
+		if (participant->secy_installed) {
+			kay->authenticated = true;
+			kay->secured = false;
+			kay->failed = false;
+			ieee802_1x_cp_connect_authenticated(kay->cp);
+			ieee802_1x_cp_sm_step(kay->cp);
+		}
 		wpa_printf(MSG_WARNING, "KaY: The Key server advise no MACsec");
 		participant->to_use_sak = false;
 		return 0;
 	}
 
 	participant->advised_desired = true;
-	kay->authenticated = false;
-	kay->secured = true;
-	kay->failed = false;
-	ieee802_1x_cp_connect_secure(kay->cp);
-	ieee802_1x_cp_sm_step(kay->cp);
+	if (participant->secy_installed) {
+		kay->authenticated = false;
+		kay->secured = true;
+		kay->failed = false;
+		ieee802_1x_cp_connect_secure(kay->cp);
+		ieee802_1x_cp_sm_step(kay->cp);
+	}
 
 	body = (struct ieee802_1x_mka_dist_sak_body *)mka_msg;
 	ieee802_1x_mka_dump_dist_sak_body(body);
@@ -1933,14 +2004,17 @@ ieee802_1x_mka_decode_dist_sak_body(
 	ieee802_1x_kay_use_data_key(sa_key);
 	dl_list_add(&participant->sak_list, &sa_key->list);
 
-	ieee802_1x_cp_set_ciphersuite(kay->cp, cs->id);
-	ieee802_1x_cp_sm_step(kay->cp);
-	ieee802_1x_cp_set_offset(kay->cp, body->confid_offset);
-	ieee802_1x_cp_sm_step(kay->cp);
-	ieee802_1x_cp_set_distributedki(kay->cp, &sa_key->key_identifier);
-	ieee802_1x_cp_set_distributedan(kay->cp, body->dan);
-	ieee802_1x_cp_signal_newsak(kay->cp);
-	ieee802_1x_cp_sm_step(kay->cp);
+	if (participant->secy_installed) {
+		ieee802_1x_cp_set_ciphersuite(kay->cp, cs->id);
+		ieee802_1x_cp_sm_step(kay->cp);
+		ieee802_1x_cp_set_offset(kay->cp, body->confid_offset);
+		ieee802_1x_cp_sm_step(kay->cp);
+		ieee802_1x_cp_set_distributedki(kay->cp,
+						      &sa_key->key_identifier);
+		ieee802_1x_cp_set_distributedan(kay->cp, body->dan);
+		ieee802_1x_cp_signal_newsak(kay->cp);
+		ieee802_1x_cp_sm_step(kay->cp);
+	}
 
 	kay->rcvd_keys++;
 	participant->to_use_sak = true;
@@ -2451,10 +2525,12 @@ ieee802_1x_kay_elect_key_server(struct ieee802_1x_mka_participant *participant)
 	}
 
 	if (i_is_key_server) {
-		ieee802_1x_cp_set_electedself(kay->cp, true);
-		if (!sci_equal(&kay->key_server_sci, &kay->actor_sci)) {
-			ieee802_1x_cp_signal_chgdserver(kay->cp);
-			ieee802_1x_cp_sm_step(kay->cp);
+		if (participant->secy_installed) {
+			ieee802_1x_cp_set_electedself(kay->cp, true);
+			if (!sci_equal(&kay->key_server_sci, &kay->actor_sci)) {
+				ieee802_1x_cp_signal_chgdserver(kay->cp);
+				ieee802_1x_cp_sm_step(kay->cp);
+			}
 		}
 
 		participant->is_key_server = true;
@@ -2471,10 +2547,12 @@ ieee802_1x_kay_elect_key_server(struct ieee802_1x_mka_participant *participant)
 		wpa_printf(MSG_DEBUG,
 			   "KaY: Peer %s was elected as the key server",
 			   mi_txt(key_server->mi));
-		ieee802_1x_cp_set_electedself(kay->cp, false);
-		if (!sci_equal(&kay->key_server_sci, &key_server->sci)) {
-			ieee802_1x_cp_signal_chgdserver(kay->cp);
-			ieee802_1x_cp_sm_step(kay->cp);
+		if (participant->secy_installed) {
+			ieee802_1x_cp_set_electedself(kay->cp, false);
+			if (!sci_equal(&kay->key_server_sci, &key_server->sci)) {
+				ieee802_1x_cp_signal_chgdserver(kay->cp);
+				ieee802_1x_cp_sm_step(kay->cp);
+			}
 		}
 
 		participant->is_key_server = false;
@@ -2566,6 +2644,42 @@ ieee802_1x_kay_decide_macsec_use(
 	}
 
 	return 0;
+}
+
+
+/**
+ * enforce_single_principal - Ensure at most one participant is principal
+ *
+ * When multiple participants are present (rollover scenario), only the one
+ * that owns the SecY state (secy_installed == true) should be principal.
+ * Other participants run MKA protocol only (send/receive MKPDUs) but do
+ * not drive CP state machine transitions.
+ */
+static void enforce_single_principal(struct ieee802_1x_kay *kay)
+{
+	struct ieee802_1x_mka_participant *p;
+	struct ieee802_1x_mka_participant *installed = NULL;
+	int count = 0;
+
+	dl_list_for_each(p, &kay->participant_list,
+			 struct ieee802_1x_mka_participant, list) {
+		count++;
+		if (p->secy_installed)
+			installed = p;
+	}
+
+	if (count <= 1)
+		return;
+
+	dl_list_for_each(p, &kay->participant_list,
+			 struct ieee802_1x_mka_participant, list) {
+		if (p != installed && p->principal) {
+			wpa_printf(MSG_DEBUG,
+				   "KaY: Demoting non-installed participant to non-principal");
+			p->principal = false;
+			p->is_key_server = false;
+		}
+	}
 }
 
 static const u8 pae_group_addr[ETH_ALEN] = {
@@ -2761,28 +2875,32 @@ static void ieee802_1x_participant_timer(void *eloop_ctx, void *timeout_ctx)
 			participant->orx = false;
 			participant->is_key_server = false;
 			participant->is_elected = false;
-			kay->authenticated = false;
-			kay->secured = false;
-			kay->failed = false;
-			kay->ltx_kn = 0;
-			kay->ltx_an = 0;
-			kay->lrx_kn = 0;
-			kay->lrx_an = 0;
-			kay->otx_kn = 0;
-			kay->otx_an = 0;
-			kay->orx_kn = 0;
-			kay->orx_an = 0;
-			dl_list_for_each_safe(txsa, pre_txsa,
-					      &participant->txsc->sa_list,
-					      struct transmit_sa, list) {
-				ieee802_1x_delete_transmit_sa(kay, txsa);
-			}
+			if (participant->secy_installed) {
+				kay->authenticated = false;
+				kay->secured = false;
+				kay->failed = false;
+				kay->ltx_kn = 0;
+				kay->ltx_an = 0;
+				kay->lrx_kn = 0;
+				kay->lrx_an = 0;
+				kay->otx_kn = 0;
+				kay->otx_an = 0;
+				kay->orx_kn = 0;
+				kay->orx_an = 0;
+				dl_list_for_each_safe(txsa, pre_txsa,
+						      &participant->txsc->sa_list,
+						      struct transmit_sa, list) {
+					ieee802_1x_delete_transmit_sa(kay, txsa);
+				}
 
-			ieee802_1x_cp_connect_pending(kay->cp);
-			ieee802_1x_cp_sm_step(kay->cp);
+				ieee802_1x_cp_connect_pending(kay->cp);
+				ieee802_1x_cp_sm_step(kay->cp);
+			}
 		} else {
 			ieee802_1x_kay_elect_key_server(participant);
-			ieee802_1x_kay_decide_macsec_use(participant);
+			if (participant->secy_installed)
+				ieee802_1x_kay_decide_macsec_use(participant);
+			enforce_single_principal(kay);
 		}
 	}
 
@@ -2798,7 +2916,8 @@ static void ieee802_1x_participant_timer(void *eloop_ctx, void *timeout_ctx)
 		}
 	}
 
-	if (participant->new_sak && participant->is_key_server) {
+	if (participant->new_sak && participant->is_key_server &&
+	    participant->secy_installed) {
 		if (!ieee802_1x_kay_generate_new_sak(participant))
 			participant->to_dist_sak = true;
 
@@ -2923,7 +3042,8 @@ ieee802_1x_kay_deinit_transmit_sc(
 	dl_list_for_each_safe(psa, tmp, &psc->sa_list, struct transmit_sa, list)
 		ieee802_1x_delete_transmit_sa(participant->kay, psa);
 
-	secy_delete_transmit_sc(participant->kay, psc);
+	if (participant->secy_installed)
+		secy_delete_transmit_sc(participant->kay, psc);
 	os_free(psc);
 }
 
@@ -3439,7 +3559,9 @@ static int ieee802_1x_kay_decode_mkpdu(struct ieee802_1x_kay *kay,
 		}
 
 		ieee802_1x_kay_elect_key_server(participant);
-		ieee802_1x_kay_decide_macsec_use(participant);
+		if (participant->secy_installed)
+			ieee802_1x_kay_decide_macsec_use(participant);
+		enforce_single_principal(kay);
 	}
 
 	/*
@@ -3842,6 +3964,7 @@ ieee802_1x_kay_create_mka(struct ieee802_1x_kay *kay,
 			  enum mka_created_mode mode, bool is_authenticator)
 {
 	struct ieee802_1x_mka_participant *participant;
+	struct ieee802_1x_mka_participant *other;
 	unsigned int usecs;
 
 	wpa_printf(MSG_DEBUG,
@@ -3861,6 +3984,15 @@ ieee802_1x_kay_create_mka(struct ieee802_1x_kay *kay,
 	if (ckn->len > MAX_CKN_LEN) {
 		wpa_printf(MSG_ERROR, "KaY: CKN is out of range (>32 bytes)");
 		return NULL;
+	}
+	dl_list_for_each(other, &kay->participant_list,
+			 struct ieee802_1x_mka_participant, list) {
+		if (other->ckn.len == ckn->len &&
+		    os_memcmp(other->ckn.name, ckn->name, ckn->len) == 0) {
+			wpa_printf(MSG_ERROR,
+				   "KaY: Duplicate CKN - participant already exists");
+			return NULL;
+		}
 	}
 	if (!kay->enable) {
 		wpa_printf(MSG_ERROR, "KaY: Now is at disable state");
@@ -3944,12 +4076,21 @@ ieee802_1x_kay_create_mka(struct ieee802_1x_kay *kay,
 	participant->new_key = NULL;
 	dl_list_init(&participant->rxsc_list);
 	participant->txsc = ieee802_1x_kay_init_transmit_sc(&kay->actor_sci);
-	secy_cp_control_protect_frames(kay, kay->macsec_protect);
-	secy_cp_control_current_cipher_suite(kay, kay->macsec_cs_id);
-	secy_cp_control_replay(kay, kay->macsec_replay_protect,
-			       kay->macsec_replay_window);
-	if (secy_create_transmit_sc(kay, participant->txsc))
+	if (!participant->txsc)
 		goto fail;
+	if (ieee802_1x_kay_get_installed_participant(kay)) {
+		participant->secy_installed = false;
+		wpa_printf(MSG_DEBUG,
+			   "KaY: Standby participant sharing installed SecY");
+	} else {
+		secy_cp_control_protect_frames(kay, kay->macsec_protect);
+		secy_cp_control_current_cipher_suite(kay, kay->macsec_cs_id);
+		secy_cp_control_replay(kay, kay->macsec_replay_protect,
+				       kay->macsec_replay_window);
+		if (secy_create_transmit_sc(kay, participant->txsc))
+			goto fail;
+		participant->secy_installed = true;
+	}
 
 	/* to derive KEK from CAK and CKN */
 	participant->kek.len = participant->cak.len;
@@ -3980,6 +4121,7 @@ ieee802_1x_kay_create_mka(struct ieee802_1x_kay *kay,
 			participant->ick.key, participant->ick.len);
 
 	dl_list_add(&kay->participant_list, &participant->list);
+	enforce_single_principal(kay);
 
 	usecs = os_random() % (kay->mka_hello_time * 1000);
 	eloop_register_timeout(0, usecs, ieee802_1x_participant_timer,
@@ -3999,7 +4141,13 @@ ieee802_1x_kay_create_mka(struct ieee802_1x_kay *kay,
 	return participant;
 
 fail:
-	os_free(participant->txsc);
+	if (participant->txsc) {
+		if (participant->secy_installed)
+			ieee802_1x_kay_deinit_transmit_sc(participant,
+							  participant->txsc);
+		else
+			os_free(participant->txsc);
+	}
 	os_free(participant);
 	return NULL;
 }
@@ -4012,9 +4160,11 @@ void
 ieee802_1x_kay_delete_mka(struct ieee802_1x_kay *kay, struct mka_key_name *ckn)
 {
 	struct ieee802_1x_mka_participant *participant;
+	struct ieee802_1x_mka_participant *standby;
 	struct ieee802_1x_kay_peer *peer;
 	struct data_key *sak;
 	struct receive_sc *rxsc;
+	bool transfer_secy = false;
 
 	if (!kay || !ckn)
 		return;
@@ -4031,6 +4181,25 @@ ieee802_1x_kay_delete_mka(struct ieee802_1x_kay *kay, struct mka_key_name *ckn)
 
 	eloop_cancel_timeout(ieee802_1x_participant_timer, participant, NULL);
 	dl_list_del(&participant->list);
+
+	if (participant->secy_installed) {
+		dl_list_for_each(standby, &kay->participant_list,
+				 struct ieee802_1x_mka_participant, list) {
+			if (!dl_list_empty(&standby->live_peers)) {
+				wpa_printf(MSG_DEBUG,
+					   "KaY: Transferring SecY ownership to standby participant");
+				standby->secy_installed = true;
+				standby->principal = true;
+				standby->new_sak = true;
+				transfer_secy = true;
+				break;
+			}
+		}
+		if (transfer_secy)
+			participant->secy_installed = false;
+	}
+	if (transfer_secy)
+		enforce_single_principal(kay);
 
 	/* remove live peer */
 	while (!dl_list_empty(&participant->live_peers)) {
