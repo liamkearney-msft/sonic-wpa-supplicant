@@ -2004,6 +2004,9 @@ ieee802_1x_mka_decode_dist_sak_body(
 	ieee802_1x_kay_use_data_key(sa_key);
 	dl_list_add(&participant->sak_list, &sa_key->list);
 
+	/* IEEE 802.1X-2020 §9.10: Only SAKs received by the principal
+	 * actor are installed to the SecY. Non-principal (standby)
+	 * participants record the SAK but do not signal CP. */
 	if (participant->secy_installed) {
 		ieee802_1x_cp_set_ciphersuite(kay->cp, cs->id);
 		ieee802_1x_cp_sm_step(kay->cp);
@@ -2313,6 +2316,53 @@ static void ieee802_1x_kay_deinit_data_key(struct data_key *pkey)
 
 
 /**
+ * ieee802_1x_kay_next_an - Select next AN per IEEE 802.1X-2020 §9.9
+ *
+ * The AN begins with the first AN following the last SAK in use by any
+ * live CA member. Scan all participants' SAK lists and TxSAs to find
+ * the maximum AN currently in use, then return (max_an + 1) mod
+ * max_sa_per_sc.
+ */
+static u8 ieee802_1x_kay_next_an(struct ieee802_1x_kay *kay)
+{
+	struct ieee802_1x_mka_participant *participant;
+	struct data_key *sak;
+	struct transmit_sa *txsa;
+	u8 max_an = 0;
+	bool found = false;
+
+	dl_list_for_each(participant, &kay->participant_list,
+			 struct ieee802_1x_mka_participant, list) {
+		dl_list_for_each(sak, &participant->sak_list, struct data_key, list)
+		{
+			if (!found || sak->an > max_an) {
+				max_an = sak->an;
+				found = true;
+			}
+		}
+
+		if (!participant->txsc)
+			continue;
+
+		dl_list_for_each(txsa, &participant->txsc->sa_list,
+				 struct transmit_sa, list) {
+			if (!txsa->in_use)
+				continue;
+			if (!found || txsa->an > max_an) {
+				max_an = txsa->an;
+				found = true;
+			}
+		}
+	}
+
+	if (!found)
+		return 0;
+
+	return (max_an + 1) % kay->max_sa_per_sc;
+}
+
+
+/**
  * ieee802_1x_kay_generate_new_sak -
  */
 static int
@@ -2346,6 +2396,16 @@ ieee802_1x_kay_generate_new_sak(struct ieee802_1x_mka_participant *participant)
 	 * here only check first item and ingore
 	 *   && (!dl_list_empty(&participant->potential_peers))) {
 	 */
+	/* IEEE 802.1X-2020 §9.5: Should not distribute a SAK using a new CAK
+	 * until MKA Life Time has elapsed since starting participation. */
+	if (participant->started_participating &&
+	    (time(NULL) - participant->started_participating) <
+	    MKA_LIFE_TIME / 1000) {
+		wpa_printf(MSG_DEBUG,
+			   "KaY: MKA Life Time not elapsed since new CAK started participating (§9.5)");
+		return -1;
+	}
+
 	if ((time(NULL) - kay->dist_time) < MKA_LIFE_TIME / 1000) {
 		wpa_printf(MSG_ERROR,
 			   "KaY: Life time has not elapsed since prior SAK distributed");
@@ -2443,9 +2503,7 @@ ieee802_1x_kay_generate_new_sak(struct ieee802_1x_mka_participant *participant)
 		peer->sak_used = false;
 
 	kay->dist_kn++;
-	kay->dist_an++;
-	if (kay->dist_an > kay->max_sa_per_sc - 1)
-		kay->dist_an = 0;
+	kay->dist_an = ieee802_1x_kay_next_an(kay);
 
 	kay->dist_time = time(NULL);
 
@@ -2648,17 +2706,114 @@ ieee802_1x_kay_decide_macsec_use(
 
 
 /**
- * enforce_single_principal - Ensure at most one participant is principal
+ * compare_key_server_candidates - Compare two elected key server candidates
+ */
+static int
+compare_key_server_candidates(u8 priority,
+			      const struct ieee802_1x_mka_sci *sci,
+			      u8 other_priority,
+			      const struct ieee802_1x_mka_sci *other_sci)
+{
+	if (priority < other_priority)
+		return -1;
+	if (other_priority < priority)
+		return 1;
+
+	return os_memcmp(sci, other_sci, sizeof(*sci));
+}
+
+
+/**
+ * participant_elected_key_server - Resolve this participant's elected server
+ */
+static bool
+participant_elected_key_server(struct ieee802_1x_mka_participant *participant,
+			       u8 *priority,
+			       struct ieee802_1x_mka_sci *sci)
+{
+	struct ieee802_1x_kay_peer *peer;
+	struct ieee802_1x_kay_peer *key_server = NULL;
+	struct ieee802_1x_kay *kay = participant->kay;
+
+	if (participant->is_obliged_key_server) {
+		*priority = kay->actor_priority;
+		os_memcpy(sci, &kay->actor_sci, sizeof(*sci));
+		return true;
+	}
+
+	dl_list_for_each(peer, &participant->live_peers,
+			 struct ieee802_1x_kay_peer, list) {
+		if (!peer->is_key_server)
+			continue;
+
+		if (!key_server ||
+		    compare_key_server_candidates(peer->key_server_priority,
+						      &peer->sci,
+						      key_server->key_server_priority,
+						      &key_server->sci) < 0)
+			key_server = peer;
+	}
+
+	if (participant->can_be_key_server &&
+	    (!key_server ||
+	     compare_key_server_candidates(kay->actor_priority,
+					       &kay->actor_sci,
+					       key_server->key_server_priority,
+					       &key_server->sci) < 0)) {
+		*priority = kay->actor_priority;
+		os_memcpy(sci, &kay->actor_sci, sizeof(*sci));
+		return true;
+	}
+
+	if (!key_server)
+		return false;
+
+	*priority = key_server->key_server_priority;
+	os_memcpy(sci, &key_server->sci, sizeof(*sci));
+	return true;
+}
+
+
+/**
+ * participant_latest_sak_kn - Get the newest SAK KN seen by a participant
+ */
+static u32
+participant_latest_sak_kn(struct ieee802_1x_mka_participant *participant)
+{
+	struct data_key *sak;
+	u32 latest_kn = 0;
+
+	dl_list_for_each(sak, &participant->sak_list, struct data_key, list) {
+		if (sak->key_identifier.kn > latest_kn)
+			latest_kn = sak->key_identifier.kn;
+	}
+
+	return latest_kn;
+}
+
+
+/**
+ * enforce_single_principal - Select principal actor per IEEE 802.1X-2020 §12.1
  *
- * When multiple participants are present (rollover scenario), only the one
- * that owns the SecY state (secy_installed == true) should be principal.
- * Other participants run MKA protocol only (send/receive MKPDUs) but do
- * not drive CP state machine transitions.
+ * Among multiple participants, the principal is selected by:
+ * 1. Must have live peers (be a "successful" actor)
+ * 2. Highest-priority key server election (lowest numeric priority)
+ * 3. Most recently received Dist-SAK (highest KN as proxy)
+ *
+ * The selected principal gets secy_installed = true (takes SecY ownership).
+ * All others get secy_installed = false and principal = false.
  */
 static void enforce_single_principal(struct ieee802_1x_kay *kay)
 {
 	struct ieee802_1x_mka_participant *p;
+	struct ieee802_1x_mka_participant *best = NULL;
 	struct ieee802_1x_mka_participant *installed = NULL;
+	struct ieee802_1x_mka_sci elected_sci;
+	struct ieee802_1x_mka_sci best_sci;
+	u8 elected_priority = 0;
+	u8 best_priority = 0;
+	u32 elected_kn;
+	u32 best_kn;
 	int count = 0;
 
 	dl_list_for_each(p, &kay->participant_list,
@@ -2671,14 +2826,76 @@ static void enforce_single_principal(struct ieee802_1x_kay *kay)
 	if (count <= 1)
 		return;
 
+	/* Select the best candidate for principal per §12.1. */
 	dl_list_for_each(p, &kay->participant_list,
 			 struct ieee802_1x_mka_participant, list) {
-		if (p != installed && p->principal) {
-			wpa_printf(MSG_DEBUG,
-				   "KaY: Demoting non-installed participant to non-principal");
-			p->principal = false;
-			p->is_key_server = false;
+		int comparison;
+
+		if (dl_list_empty(&p->live_peers))
+			continue;
+		if (!p->is_elected)
+			continue;
+		if (!participant_elected_key_server(p, &elected_priority,
+						      &elected_sci))
+			continue;
+
+		if (!best) {
+			best = p;
+			best_priority = elected_priority;
+			os_memcpy(&best_sci, &elected_sci, sizeof(best_sci));
+			continue;
 		}
+
+		comparison = compare_key_server_candidates(elected_priority,
+							      &elected_sci,
+							      best_priority,
+							      &best_sci);
+		if (comparison < 0) {
+			best = p;
+			best_priority = elected_priority;
+			os_memcpy(&best_sci, &elected_sci, sizeof(best_sci));
+			continue;
+		}
+		if (comparison > 0)
+			continue;
+
+		elected_kn = participant_latest_sak_kn(p);
+		best_kn = participant_latest_sak_kn(best);
+		if (elected_kn > best_kn) {
+			best = p;
+			best_priority = elected_priority;
+			os_memcpy(&best_sci, &elected_sci, sizeof(best_sci));
+		}
+	}
+
+	/* If no candidate has live peers, keep the current SecY owner. */
+	if (!best) {
+		if (installed) {
+			installed->principal = true;
+			return;
+		}
+		return;
+	}
+
+	/* Transfer SecY ownership to the selected principal. */
+	dl_list_for_each(p, &kay->participant_list,
+			 struct ieee802_1x_mka_participant, list) {
+		if (p == best) {
+			if (!p->secy_installed) {
+				wpa_printf(MSG_DEBUG,
+					   "KaY: Transferring SecY to principal participant (§12.1)");
+				p->secy_installed = true;
+			}
+			p->principal = true;
+			continue;
+		}
+
+		if (p->secy_installed)
+			wpa_printf(MSG_DEBUG,
+				   "KaY: Revoking SecY from non-principal participant");
+		p->secy_installed = false;
+		p->principal = false;
+		p->is_key_server = false;
 	}
 }
 
@@ -4137,6 +4354,7 @@ ieee802_1x_kay_create_mka(struct ieee802_1x_kay *kay,
 			usecs / 1000000;
 	}
 	participant->mode = mode;
+	participant->started_participating = time(NULL);
 
 	return participant;
 
@@ -4181,6 +4399,16 @@ ieee802_1x_kay_delete_mka(struct ieee802_1x_kay *kay, struct mka_key_name *ckn)
 
 	eloop_cancel_timeout(ieee802_1x_participant_timer, participant, NULL);
 	dl_list_del(&participant->list);
+
+	/* IEEE 802.1X-2020 §9.3.2: Should not delete the old participant
+	 * until MKA Life Time has elapsed since the new SAK was first
+	 * distributed by the replacement participant. However, only warn
+	 * rather than block, since the caller may have good reason. */
+	if (participant->secy_installed && kay->dist_time > 0 &&
+	    (time(NULL) - kay->dist_time) < MKA_LIFE_TIME / 1000) {
+		wpa_printf(MSG_WARNING,
+			   "KaY: Deleting old participant before MKA Life Time elapsed since last SAK distribution (§9.3.2)");
+	}
 
 	if (participant->secy_installed) {
 		dl_list_for_each(standby, &kay->participant_list,
