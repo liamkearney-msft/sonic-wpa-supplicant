@@ -2396,9 +2396,14 @@ ieee802_1x_kay_generate_new_sak(struct ieee802_1x_mka_participant *participant)
 	 * here only check first item and ingore
 	 *   && (!dl_list_empty(&participant->potential_peers))) {
 	 */
-	/* IEEE 802.1X-2020 §9.5: Should not distribute a SAK using a new CAK
-	 * until MKA Life Time has elapsed since starting participation. */
-	if (participant->started_participating &&
+	/* IEEE 802.1X-2020 §9.5: A Key Server should not distribute a SAK using
+	 * a new CAK until MKA Life Time has elapsed since it started
+	 * participating with that CAK. This is a succession provision intended
+	 * to protect a member that holds both the prior and the new CAK, so it
+	 * applies only once a prior CAK has already distributed a SAK on this
+	 * KaY (kay->dist_time != 0). The first SAK at initial establishment is
+	 * not delayed. */
+	if (kay->dist_time != 0 && participant->started_participating &&
 	    (time(NULL) - participant->started_participating) <
 	    MKA_LIFE_TIME / 1000) {
 		wpa_printf(MSG_DEBUG,
