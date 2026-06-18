@@ -4464,6 +4464,21 @@ ieee802_1x_kay_delete_mka(struct ieee802_1x_kay *kay, struct mka_key_name *ckn)
 
 
 /**
+ * ieee802_1x_kay_participant_exists - Check if a participant with the given
+ * CKN is currently present on the KaY.
+ * Returns true if a matching participant exists, false otherwise.
+ */
+bool ieee802_1x_kay_participant_exists(struct ieee802_1x_kay *kay,
+				       const struct mka_key_name *ckn)
+{
+	if (!kay || !ckn)
+		return false;
+
+	return ieee802_1x_kay_get_participant(kay, ckn->name, ckn->len) != NULL;
+}
+
+
+/**
  * ieee802_1x_kay_mka_participate -
  */
 void ieee802_1x_kay_mka_participate(struct ieee802_1x_kay *kay,

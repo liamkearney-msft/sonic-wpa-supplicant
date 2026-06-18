@@ -10407,6 +10407,27 @@ static int wpas_ctrl_iface_configure_mscs(struct wpa_supplicant *wpa_s,
 
 
 #ifdef CONFIG_MACSEC
+/*
+ * Locate a "<key>=" token in a control-interface command and return a pointer
+ * to its value, or NULL if not present. The token must be at the start of the
+ * command or immediately preceded by a space, so a search for "ckn=" does not
+ * spuriously match the "ckn=" inside "old_ckn=".
+ */
+static const char * mka_get_param(const char *cmd, const char *key)
+{
+	size_t key_len = os_strlen(key);
+	const char *pos = cmd;
+
+	while ((pos = os_strstr(pos, key)) != NULL) {
+		if (pos == cmd || pos[-1] == ' ')
+			return pos + key_len;
+		pos += key_len;
+	}
+
+	return NULL;
+}
+
+
 static int wpa_supplicant_ctrl_iface_mka_add_key(
 	struct wpa_supplicant *wpa_s, const char *cmd)
 {
@@ -10426,12 +10447,11 @@ static int wpa_supplicant_ctrl_iface_mka_add_key(
 	if (!cak || !ckn)
 		goto done;
 
-	pos = os_strstr(cmd, "cak=");
+	pos = mka_get_param(cmd, "cak=");
 	if (!pos) {
 		wpa_printf(MSG_ERROR, "MKA_ADD_KEY: missing cak=");
 		goto done;
 	}
-	pos += 4;
 	end = os_strchr(pos, ' ');
 	len = end ? (size_t) (end - pos) : os_strlen(pos);
 	if (len > 2 * MACSEC_CAK_MAX_LEN || len % 2 != 0 ||
@@ -10445,12 +10465,11 @@ static int wpa_supplicant_ctrl_iface_mka_add_key(
 		goto done;
 	}
 
-	pos = os_strstr(cmd, "ckn=");
+	pos = mka_get_param(cmd, "ckn=");
 	if (!pos) {
 		wpa_printf(MSG_ERROR, "MKA_ADD_KEY: missing ckn=");
 		goto done;
 	}
-	pos += 4;
 	end = os_strchr(pos, ' ');
 	len = end ? (size_t) (end - pos) : os_strlen(pos);
 	if (len > 2 * MACSEC_CKN_MAX_LEN || len < 2 || len % 2 != 0) {
@@ -10485,12 +10504,11 @@ static int wpa_supplicant_ctrl_iface_mka_del_key(
 		return -1;
 	}
 
-	pos = os_strstr(cmd, "ckn=");
+	pos = mka_get_param(cmd, "ckn=");
 	if (!pos) {
 		wpa_printf(MSG_ERROR, "MKA_DEL_KEY: missing ckn=");
 		return -1;
 	}
-	pos += 4;
 	end = os_strchr(pos, ' ');
 	len = end ? (size_t) (end - pos) : os_strlen(pos);
 	if (len > 2 * MACSEC_CKN_MAX_LEN || len < 2 || len % 2 != 0) {
@@ -10524,12 +10542,11 @@ static int wpa_supplicant_ctrl_iface_mka_update_key(
 	}
 
 	/* Parse old_ckn — the CKN of the participant to replace */
-	pos = os_strstr(cmd, "old_ckn=");
+	pos = mka_get_param(cmd, "old_ckn=");
 	if (!pos) {
 		wpa_printf(MSG_ERROR, "MKA_UPDATE_KEY: missing old_ckn=");
 		return -1;
 	}
-	pos += 8;
 	end = os_strchr(pos, ' ');
 	len = end ? (size_t) (end - pos) : os_strlen(pos);
 	if (len > 2 * MACSEC_CKN_MAX_LEN || len < 2 || len % 2 != 0) {
@@ -10548,12 +10565,11 @@ static int wpa_supplicant_ctrl_iface_mka_update_key(
 	if (!cak || !ckn)
 		goto done;
 
-	pos = os_strstr(cmd, "cak=");
+	pos = mka_get_param(cmd, "cak=");
 	if (!pos) {
 		wpa_printf(MSG_ERROR, "MKA_UPDATE_KEY: missing cak=");
 		goto done;
 	}
-	pos += 4;
 	end = os_strchr(pos, ' ');
 	len = end ? (size_t) (end - pos) : os_strlen(pos);
 	if (len > 2 * MACSEC_CAK_MAX_LEN || len % 2 != 0 ||
@@ -10567,12 +10583,11 @@ static int wpa_supplicant_ctrl_iface_mka_update_key(
 		goto done;
 	}
 
-	pos = os_strstr(cmd, "ckn=");
+	pos = mka_get_param(cmd, "ckn=");
 	if (!pos) {
 		wpa_printf(MSG_ERROR, "MKA_UPDATE_KEY: missing ckn=");
 		goto done;
 	}
-	pos += 4;
 	end = os_strchr(pos, ' ');
 	len = end ? (size_t) (end - pos) : os_strlen(pos);
 	if (len > 2 * MACSEC_CKN_MAX_LEN || len < 2 || len % 2 != 0) {
@@ -10585,11 +10600,40 @@ static int wpa_supplicant_ctrl_iface_mka_update_key(
 		goto done;
 	}
 
-	/* Delete old participant, then create new one */
+	/*
+	 * Validate against current KaY state before the destructive delete so a
+	 * bad request cannot strand the session. The old participant must exist,
+	 * and the new CKN must not collide with a different existing participant
+	 * (e.g. the fallback), which would make the create below fail after the
+	 * old key has already been removed.
+	 */
+	if (!ieee802_1x_kay_participant_exists(wpa_s->kay, &old_ckn)) {
+		wpa_printf(MSG_ERROR,
+			   "MKA_UPDATE_KEY: old_ckn participant not found");
+		goto done;
+	}
+	if ((ckn->len != old_ckn.len ||
+	     os_memcmp(ckn->name, old_ckn.name, ckn->len) != 0) &&
+	    ieee802_1x_kay_participant_exists(wpa_s->kay, ckn)) {
+		wpa_printf(MSG_ERROR,
+			   "MKA_UPDATE_KEY: ckn already in use by another participant");
+		goto done;
+	}
+
+	/*
+	 * This is not atomic: the old participant is removed first so its
+	 * Association Numbers are freed for the new key, then the replacement is
+	 * created. If the create fails, the session continues on the fallback
+	 * participant, which the caller is required to have established before
+	 * rotating the primary key.
+	 */
 	ieee802_1x_kay_delete_mka(wpa_s->kay, &old_ckn);
 
 	if (ieee802_1x_kay_create_mka(wpa_s->kay, ckn, cak, 0, PSK, false))
 		ret = 0;
+	else
+		wpa_printf(MSG_ERROR,
+			   "MKA_UPDATE_KEY: failed to create replacement participant; session remains on fallback");
 
 done:
 	os_free(cak);
