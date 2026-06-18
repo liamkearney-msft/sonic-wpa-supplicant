@@ -3710,7 +3710,7 @@ static const struct wpa_cli_cmd wpa_cli_commands[] = {
 	  "ckn=<hex> = delete an MKA key by CKN" },
 	{ "mka_update_key", wpa_cli_cmd_mka_update_key, NULL,
 	  cli_cmd_flag_sensitive,
-	  "old_ckn=<hex> cak=<hex> ckn=<hex> = replace an MKA key (atomic delete + add)" },
+	  "old_ckn=<hex> cak=<hex> ckn=<hex> = replace an MKA key (delete old, add new)" },
 #endif /* CONFIG_MACSEC */
 	{ "vendor_elem_add", wpa_cli_cmd_vendor_elem_add, NULL,
 	  cli_cmd_flag_none,

@@ -265,6 +265,8 @@ ieee802_1x_kay_create_mka(struct ieee802_1x_kay *kay,
 			  bool is_authenticator);
 void ieee802_1x_kay_delete_mka(struct ieee802_1x_kay *kay,
 			       struct mka_key_name *ckn);
+bool ieee802_1x_kay_participant_exists(struct ieee802_1x_kay *kay,
+				       const struct mka_key_name *ckn);
 void ieee802_1x_kay_mka_participate(struct ieee802_1x_kay *kay,
 				    struct mka_key_name *ckn,
 				    bool status);
