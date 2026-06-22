@@ -4594,13 +4594,19 @@ ieee802_1x_kay_delete_mka(struct ieee802_1x_kay *kay, struct mka_key_name *ckn)
 			   "KaY: Deleting old participant before MKA Life Time elapsed since last SAK distribution (§9.3.2)");
 	}
 
-	/* Warm dual-SAK: if the deleted participant was the transmit owner,
-	 * re-select an owner among the remaining warm standbys. They already
-	 * have receive SAs installed, so enforce_single_principal() hands
-	 * transmit over via owner_adopt_transmit() without a cold rebuild. The
-	 * participant has already been unlinked from participant_list above, so
-	 * it is not reconsidered. */
-	if (participant->secy_installed) {
+	/* Warm dual-SAK: if the deleted participant was the transmit owner and
+	 * other participants remain, re-select an owner among the warm
+	 * standbys. They already have receive SAs installed, so
+	 * enforce_single_principal() hands transmit over via
+	 * owner_adopt_transmit() without a cold rebuild, and the shared
+	 * actor-SCI driver TxSC is left in place for the successor (clearing
+	 * secy_installed keeps the teardown below from deleting it).
+	 *
+	 * If no participant remains (the single-CAK case), leave secy_installed
+	 * set so the driver TxSC and SAs are torn down normally below —
+	 * behaviour identical to the unmodified single-participant path. */
+	if (participant->secy_installed &&
+	    !dl_list_empty(&kay->participant_list)) {
 		participant->secy_installed = false;
 		enforce_single_principal(kay);
 	}
