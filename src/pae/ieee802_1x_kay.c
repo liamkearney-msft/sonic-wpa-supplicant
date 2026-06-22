@@ -370,6 +370,16 @@ ieee802_1x_kay_get_principal_participant(struct ieee802_1x_kay *kay)
 {
 	struct ieee802_1x_mka_participant *participant;
 
+	/* Warm dual-SAK: the CP state machine manages the transmit owner's
+	 * SAs, so the "principal" for CP-driven SA operations is the transmit
+	 * owner (secy_installed). Fall back to the principal flag for the
+	 * single-participant case. */
+	dl_list_for_each(participant, &kay->participant_list,
+			 struct ieee802_1x_mka_participant, list) {
+		if (participant->secy_installed)
+			return participant;
+	}
+
 	dl_list_for_each(participant, &kay->participant_list,
 			 struct ieee802_1x_mka_participant, list) {
 		if (participant->principal)
@@ -539,6 +549,9 @@ ieee802_1x_kay_init_receive_sa(struct receive_sc *psc, u8 an, u32 lowest_pn,
 
 
 static void ieee802_1x_kay_deinit_data_key(struct data_key *pkey);
+static int ieee802_1x_kay_install_warm_rxsas(
+	struct ieee802_1x_mka_participant *participant,
+	struct data_key *sa_key);
 static bool
 ieee802_1x_kay_is_shared_receive_sc(struct ieee802_1x_mka_participant *participant,
 				    const struct receive_sc *psc);
@@ -2004,9 +2017,16 @@ ieee802_1x_mka_decode_dist_sak_body(
 	ieee802_1x_kay_use_data_key(sa_key);
 	dl_list_add(&participant->sak_list, &sa_key->list);
 
-	/* IEEE 802.1X-2020 §9.10: Only SAKs received by the principal
-	 * actor are installed to the SecY. Non-principal (standby)
-	 * participants record the SAK but do not signal CP. */
+	/* Warm dual-SAK SA installation.
+	 *
+	 * Transmit owner (secy_installed): drive the CP state machine, which
+	 * installs both the receive SAs and the transmit SA and manages the
+	 * hitless latest/old rollover — unchanged from stock behaviour.
+	 *
+	 * Warm standby (not the transmit owner): install receive SAs directly
+	 * for this SAK so it is receivable now, without transmitting on it.
+	 * This is the receive-side §9.10 deviation (see
+	 * ieee802_1x_kay_install_warm_rxsas). */
 	if (participant->secy_installed) {
 		ieee802_1x_cp_set_ciphersuite(kay->cp, cs->id);
 		ieee802_1x_cp_sm_step(kay->cp);
@@ -2017,6 +2037,8 @@ ieee802_1x_mka_decode_dist_sak_body(
 		ieee802_1x_cp_set_distributedan(kay->cp, body->dan);
 		ieee802_1x_cp_signal_newsak(kay->cp);
 		ieee802_1x_cp_sm_step(kay->cp);
+	} else {
+		ieee802_1x_kay_install_warm_rxsas(participant, sa_key);
 	}
 
 	kay->rcvd_keys++;
@@ -2494,14 +2516,23 @@ ieee802_1x_kay_generate_new_sak(struct ieee802_1x_mka_participant *participant)
 	ieee802_1x_kay_use_data_key(sa_key);
 	dl_list_add(&participant->sak_list, &sa_key->list);
 
-	ieee802_1x_cp_set_ciphersuite(kay->cp, cs->id);
-	ieee802_1x_cp_sm_step(kay->cp);
-	ieee802_1x_cp_set_offset(kay->cp, kay->macsec_confidentiality);
-	ieee802_1x_cp_sm_step(kay->cp);
-	ieee802_1x_cp_set_distributedki(kay->cp, &sa_key->key_identifier);
-	ieee802_1x_cp_set_distributedan(kay->cp, sa_key->an);
-	ieee802_1x_cp_signal_newsak(kay->cp);
-	ieee802_1x_cp_sm_step(kay->cp);
+	/* Warm dual-SAK: the transmit owner drives the CP (installs receive +
+	 * transmit SAs, manages the hitless rollover). A non-owner Key Server
+	 * distributes its SAK proactively (so the standby stays warm) and
+	 * installs only receive SAs for it; it does not transmit. */
+	if (participant->secy_installed) {
+		ieee802_1x_cp_set_ciphersuite(kay->cp, cs->id);
+		ieee802_1x_cp_sm_step(kay->cp);
+		ieee802_1x_cp_set_offset(kay->cp, kay->macsec_confidentiality);
+		ieee802_1x_cp_sm_step(kay->cp);
+		ieee802_1x_cp_set_distributedki(kay->cp,
+						&sa_key->key_identifier);
+		ieee802_1x_cp_set_distributedan(kay->cp, sa_key->an);
+		ieee802_1x_cp_signal_newsak(kay->cp);
+		ieee802_1x_cp_sm_step(kay->cp);
+	} else {
+		ieee802_1x_kay_install_warm_rxsas(participant, sa_key);
+	}
 
 	dl_list_for_each(peer, &participant->live_peers,
 			 struct ieee802_1x_kay_peer, list)
@@ -3138,8 +3169,11 @@ static void ieee802_1x_participant_timer(void *eloop_ctx, void *timeout_ctx)
 		}
 	}
 
+	/* Warm dual-SAK: a Key Server distributes its SAK whether or not it is
+	 * the transmit owner, so the fallback participant stays warm. A
+	 * draining participant no longer distributes. */
 	if (participant->new_sak && participant->is_key_server &&
-	    participant->secy_installed) {
+	    !participant->draining) {
 		if (!ieee802_1x_kay_generate_new_sak(participant))
 			participant->to_dist_sak = true;
 
@@ -3365,6 +3399,55 @@ static struct receive_sa * lookup_rxsa_by_an(struct receive_sc *rxsc, u8 an)
 	}
 
 	return NULL;
+}
+
+
+/*
+ * ieee802_1x_kay_install_warm_rxsas - Warm dual-SAK receive install.
+ *
+ * Install (or refresh) receive SAs for a participant's own SAK on each of its
+ * (shared) RxSCs, so the SAK is receivable even while the participant is not
+ * the transmit owner. This is the receive-side deviation from IEEE
+ * 802.1X-2020 §9.10 (strictly, only the principal installs SAs): it is
+ * receive-only and purely additive, so it cannot cause the partial
+ * connectivity §9.10 guards against. The transmit SA is installed elsewhere
+ * and only for the transmit owner.
+ *
+ * This path is driven directly, not through the single KaY CP state machine,
+ * so a warm standby participant's receive SA coexists with the transmit
+ * owner's SAs at a distinct AN. AN distinctness relies on the KaY-level
+ * allocation (ieee802_1x_kay_next_an) and requires max_sa_per_sc >= 4.
+ *
+ * NOTE: compile-validated only; the warm dual-SAK behaviour requires
+ * virtual-switch validation (cross-peer AN coordination in particular).
+ */
+static int ieee802_1x_kay_install_warm_rxsas(
+	struct ieee802_1x_mka_participant *participant,
+	struct data_key *sa_key)
+{
+	struct ieee802_1x_kay *kay = participant->kay;
+	struct receive_sc *rxsc;
+	struct receive_sa *rxsa;
+
+	if (!sa_key)
+		return -1;
+
+	dl_list_for_each(rxsc, &participant->rxsc_list, struct receive_sc,
+			 list) {
+		/* Replace any existing RxSA at this AN (idempotent on retry). */
+		while ((rxsa = lookup_rxsa_by_an(rxsc, sa_key->an)) != NULL)
+			ieee802_1x_delete_receive_sa(kay, rxsa);
+
+		rxsa = ieee802_1x_kay_init_receive_sa(rxsc, sa_key->an, 1,
+						      sa_key);
+		if (!rxsa)
+			return -1;
+
+		secy_create_receive_sa(kay, rxsa);
+	}
+
+	participant->warm_rx = true;
+	return 0;
 }
 
 
