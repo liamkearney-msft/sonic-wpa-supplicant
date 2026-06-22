@@ -2828,16 +2828,70 @@ participant_latest_sak_kn(struct ieee802_1x_mka_participant *participant)
 }
 
 
+/*
+ * ieee802_1x_kay_owner_adopt_transmit - Make a newly selected transmit owner
+ * start transmitting on its own (already-distributed, warm) SAK.
+ *
+ * The new owner already has receive SAs installed (warm_rx). To take over
+ * transmit, drive the CP state machine with the owner's latest SAK; the CP
+ * installs the transmit SA on the shared (actor-SCI) TxSC and performs the
+ * hitless latest/old switch. The previous owner drains — it keeps its receive
+ * SAs until deleted — so traffic is received on both SAKs across the switch.
+ *
+ * NOTE: high-risk path requiring virtual-switch validation (transmit handover
+ * over the shared actor-SCI TxSC).
+ */
+static void ieee802_1x_kay_owner_adopt_transmit(
+	struct ieee802_1x_mka_participant *owner)
+{
+	struct ieee802_1x_kay *kay = owner->kay;
+	struct data_key *sak, *latest = NULL;
+	u32 latest_kn = 0;
+	struct macsec_ciphersuite *cs;
+
+	dl_list_for_each(sak, &owner->sak_list, struct data_key, list) {
+		if (!latest || sak->key_identifier.kn >= latest_kn) {
+			latest_kn = sak->key_identifier.kn;
+			latest = sak;
+		}
+	}
+	if (!latest) {
+		wpa_printf(MSG_DEBUG,
+			   "KaY: New transmit owner has no SAK yet; transmit starts once its SAK is distributed");
+		return;
+	}
+
+	wpa_printf(MSG_DEBUG,
+		   "KaY: Transmit owner adopting SAK (kn=%u, an=%u)",
+		   latest->key_identifier.kn, latest->an);
+
+	cs = &cipher_suite_tbl[kay->macsec_csindex];
+	ieee802_1x_cp_set_ciphersuite(kay->cp, cs->id);
+	ieee802_1x_cp_sm_step(kay->cp);
+	ieee802_1x_cp_set_offset(kay->cp, latest->confidentiality_offset);
+	ieee802_1x_cp_sm_step(kay->cp);
+	ieee802_1x_cp_set_distributedki(kay->cp, &latest->key_identifier);
+	ieee802_1x_cp_set_distributedan(kay->cp, latest->an);
+	ieee802_1x_cp_signal_newsak(kay->cp);
+	ieee802_1x_cp_sm_step(kay->cp);
+}
+
+
 /**
- * enforce_single_principal - Select principal actor per IEEE 802.1X-2020 §12.1
+ * enforce_single_principal - Select the transmit owner (IEEE 802.1X-2020 §12.1)
  *
- * Among multiple participants, the principal is selected by:
- * 1. Must have live peers (be a "successful" actor)
- * 2. Highest-priority key server election (lowest numeric priority)
- * 3. Most recently received Dist-SAK (highest KN as proxy)
+ * Warm dual-SAK model: every established participant keeps receive SAs warm;
+ * exactly one — the transmit owner (secy_installed) — installs and enables the
+ * transmit SA. This selects that owner:
+ * 1. Must be a successful actor (live peers, elected) with a SAK to transmit.
+ * 2. Highest-priority elected Key Server (lowest numeric priority).
+ * 3. On a tie, prefer the designated primary slot (is_primary_slot), so a
+ *    rollover returns transmit to the primary rather than sticking on the
+ *    fallback. Same-slot ties fall back to most-recent SAK (highest KN).
  *
- * The selected principal gets secy_installed = true (takes SecY ownership).
- * All others get secy_installed = false and principal = false.
+ * Handover is hitless: the new owner adopts transmit while the previous owner
+ * drains (keeps receive SAs until deleted). Other participants remain warm
+ * standbys (receive installed, not transmitting).
  */
 static void enforce_single_principal(struct ieee802_1x_kay *kay)
 {
@@ -2862,14 +2916,19 @@ static void enforce_single_principal(struct ieee802_1x_kay *kay)
 	if (count <= 1)
 		return;
 
-	/* Select the best candidate for principal per §12.1. */
+	/* Select the best candidate for transmit owner. */
 	dl_list_for_each(p, &kay->participant_list,
 			 struct ieee802_1x_mka_participant, list) {
 		int comparison;
 
+		if (p->draining)
+			continue;
 		if (dl_list_empty(&p->live_peers))
 			continue;
 		if (!p->is_elected)
+			continue;
+		/* Must have a SAK available to transmit on. */
+		if (dl_list_empty(&p->sak_list))
 			continue;
 		if (!participant_elected_key_server(p, &elected_priority,
 						      &elected_sci))
@@ -2895,6 +2954,17 @@ static void enforce_single_principal(struct ieee802_1x_kay *kay)
 		if (comparison > 0)
 			continue;
 
+		/* Tie on Key Server: prefer the designated primary slot. */
+		if (p->is_primary_slot && !best->is_primary_slot) {
+			best = p;
+			best_priority = elected_priority;
+			os_memcpy(&best_sci, &elected_sci, sizeof(best_sci));
+			continue;
+		}
+		if (!p->is_primary_slot && best->is_primary_slot)
+			continue;
+
+		/* Same slot: most recently distributed SAK. */
 		elected_kn = participant_latest_sak_kn(p);
 		best_kn = participant_latest_sak_kn(best);
 		if (elected_kn > best_kn) {
@@ -2904,34 +2974,44 @@ static void enforce_single_principal(struct ieee802_1x_kay *kay)
 		}
 	}
 
-	/* If no candidate has live peers, keep the current SecY owner. */
+	/* If no eligible candidate, keep the current transmit owner. */
 	if (!best) {
-		if (installed) {
+		if (installed)
 			installed->principal = true;
-			return;
-		}
 		return;
 	}
 
-	/* Transfer SecY ownership to the selected principal. */
+	if (best == installed) {
+		best->principal = true;
+		return;
+	}
+
+	/* Hand transmit over to the selected owner; drain the previous one. */
+	best->secy_installed = true;
+	best->principal = true;
+	best->draining = false;
+	wpa_printf(MSG_DEBUG,
+		   "KaY: Transmit ownership -> %s slot (warm handover)",
+		   best->is_primary_slot ? "primary" : "fallback");
+	ieee802_1x_kay_owner_adopt_transmit(best);
+
 	dl_list_for_each(p, &kay->participant_list,
 			 struct ieee802_1x_mka_participant, list) {
-		if (p == best) {
-			if (!p->secy_installed) {
-				wpa_printf(MSG_DEBUG,
-					   "KaY: Transferring SecY to principal participant (§12.1)");
-				p->secy_installed = true;
-			}
-			p->principal = true;
+		if (p == best)
+			continue;
+		if (p == installed) {
+			/* Previous owner: drain (keep receive SAs, stop tx). */
+			p->secy_installed = false;
+			p->principal = false;
+			p->draining = true;
+			p->drain_started = time(NULL);
+			wpa_printf(MSG_DEBUG,
+				   "KaY: Previous transmit owner draining");
 			continue;
 		}
-
-		if (p->secy_installed)
-			wpa_printf(MSG_DEBUG,
-				   "KaY: Revoking SecY from non-principal participant");
+		/* Other participants stay warm standbys. */
 		p->secy_installed = false;
 		p->principal = false;
-		p->is_key_server = false;
 	}
 }
 
@@ -3054,6 +3134,19 @@ static void ieee802_1x_participant_timer(void *eloop_ctx, void *timeout_ctx)
 	kay = participant->kay;
 	wpa_printf(MSG_DEBUG, "KaY: Participant timer (ifname=%s)",
 		   kay->if_name);
+
+	/* Warm dual-SAK: a draining participant (former transmit owner) keeps
+	 * its receive SAs so a peer that has not yet switched off its SAK is
+	 * still received. Per IEEE 802.1X-2020 §9.3.2, retain it for MKA Life
+	 * Time after draining began, then delete it. */
+	if (participant->draining) {
+		if (now - participant->drain_started >= MKA_LIFE_TIME / 1000) {
+			wpa_printf(MSG_DEBUG,
+				   "KaY: Drained participant retired after MKA Life Time");
+			goto delete_mka;
+		}
+	}
+
 	if (participant->cak_life) {
 		if (now > participant->cak_life)
 			goto delete_mka;
@@ -4391,6 +4484,12 @@ ieee802_1x_kay_create_mka(struct ieee802_1x_kay *kay,
 			goto fail;
 		}
 		participant->secy_installed = false;
+		/* Warm dual-SAK: a participant created while an owner already
+		 * exists is a fallback-slot standby. NOTE: runtime primary
+		 * rotation (mka_update_key) currently also lands here; carrying
+		 * the primary-slot designation through the control interface is
+		 * a follow-up so transmit returns to the rotated-in primary. */
+		participant->is_primary_slot = false;
 		wpa_printf(MSG_DEBUG,
 			   "KaY: Standby participant sharing installed SecY");
 	} else {
@@ -4401,6 +4500,8 @@ ieee802_1x_kay_create_mka(struct ieee802_1x_kay *kay,
 		if (secy_create_transmit_sc(kay, participant->txsc))
 			goto fail;
 		participant->secy_installed = true;
+		/* First participant / initial transmit owner = primary slot. */
+		participant->is_primary_slot = true;
 	}
 
 	/* to derive KEK from CAK and CKN */
@@ -4472,11 +4573,9 @@ void
 ieee802_1x_kay_delete_mka(struct ieee802_1x_kay *kay, struct mka_key_name *ckn)
 {
 	struct ieee802_1x_mka_participant *participant;
-	struct ieee802_1x_mka_participant *standby;
 	struct ieee802_1x_kay_peer *peer;
 	struct data_key *sak;
 	struct receive_sc *rxsc;
-	bool transfer_secy = false;
 
 	if (!kay || !ckn)
 		return;
@@ -4504,24 +4603,16 @@ ieee802_1x_kay_delete_mka(struct ieee802_1x_kay *kay, struct mka_key_name *ckn)
 			   "KaY: Deleting old participant before MKA Life Time elapsed since last SAK distribution (§9.3.2)");
 	}
 
+	/* Warm dual-SAK: if the deleted participant was the transmit owner,
+	 * re-select an owner among the remaining warm standbys. They already
+	 * have receive SAs installed, so enforce_single_principal() hands
+	 * transmit over via owner_adopt_transmit() without a cold rebuild. The
+	 * participant has already been unlinked from participant_list above, so
+	 * it is not reconsidered. */
 	if (participant->secy_installed) {
-		dl_list_for_each(standby, &kay->participant_list,
-				 struct ieee802_1x_mka_participant, list) {
-			if (!dl_list_empty(&standby->live_peers)) {
-				wpa_printf(MSG_DEBUG,
-					   "KaY: Transferring SecY ownership to standby participant");
-				standby->secy_installed = true;
-				standby->principal = true;
-				standby->new_sak = true;
-				transfer_secy = true;
-				break;
-			}
-		}
-		if (transfer_secy)
-			participant->secy_installed = false;
-	}
-	if (transfer_secy)
+		participant->secy_installed = false;
 		enforce_single_principal(kay);
+	}
 
 	/* remove live peer */
 	while (!dl_list_empty(&participant->live_peers)) {
@@ -4748,7 +4839,11 @@ int ieee802_1x_kay_get_status(struct ieee802_1x_kay *kay, char *buf,
 				  "live_peers=%u\n"
 				  "potential_peers=%u\n"
 				  "is_key_server=%s\n"
-				  "is_elected=%s\n",
+				  "is_elected=%s\n"
+				  "transmit_owner=%s\n"
+				  "warm_rx=%s\n"
+				  "primary_slot=%s\n"
+				  "draining=%s\n",
 				  mi_txt(p->mi), p->mn,
 				  yes_no(p->active),
 				  yes_no(p->participant),
@@ -4756,7 +4851,11 @@ int ieee802_1x_kay_get_status(struct ieee802_1x_kay *kay, char *buf,
 				  dl_list_len(&p->live_peers),
 				  dl_list_len(&p->potential_peers),
 				  yes_no(p->is_key_server),
-				  yes_no(p->is_elected));
+				  yes_no(p->is_elected),
+				  yes_no(p->secy_installed),
+				  yes_no(p->warm_rx),
+				  yes_no(p->is_primary_slot),
+				  yes_no(p->draining));
 		if (os_snprintf_error(end - pos2, res))
 			return end - pos;
 		pos2 += res;
