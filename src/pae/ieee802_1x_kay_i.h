@@ -153,10 +153,26 @@ struct ieee802_1x_mka_participant {
 
 	struct ieee802_1x_kay *kay;
 
-	/* Shared-SC rollover: only the secy_installed participant owns the
-	 * driver-level TxSC/RxSCs. Non-installed participants share the
-	 * installed participant's SCs and install their SAs on them. */
+	/* Shared-SC rollover: only the secy_installed participant is the
+	 * transmit owner — it installs/enables the single transmit SA and
+	 * drives the CP state machine. Non-owner participants share the
+	 * owner's driver-level SCs. */
 	bool secy_installed;
+	/* Warm dual-SAK: this participant has installed (receive) SAs for its
+	 * own SAK on the shared RxSCs, so its SAK is receivable even while it
+	 * is not the transmit owner. Both the owner and a warm standby set
+	 * this. Decoupled from the single CP state machine. */
+	bool warm_rx;
+	/* Draining: this participant is no longer the transmit owner and is
+	 * being retired, but its receive SAs are retained until the peer has
+	 * moved off its SAK (IEEE 802.1X-2020 §9.3.2). drain_started records
+	 * when draining began; the participant is deleted after MKA Life Time. */
+	bool draining;
+	time_t drain_started;
+	/* Designated-primary preference: true for the primary key slot, false
+	 * for the fallback. Transmit ownership returns to the primary slot once
+	 * it is warm, so the fallback reverts to standby after a rollover. */
+	bool is_primary_slot;
 	/* IEEE 802.1X-2020 §9.5: Track when this participant started
 	 * participating to enforce MKA Life Time delay before distributing
 	 * a new SAK. */
