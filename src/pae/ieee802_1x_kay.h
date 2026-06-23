@@ -267,6 +267,17 @@ void ieee802_1x_kay_delete_mka(struct ieee802_1x_kay *kay,
 			       struct mka_key_name *ckn);
 bool ieee802_1x_kay_participant_exists(struct ieee802_1x_kay *kay,
 				       const struct mka_key_name *ckn);
+bool ieee802_1x_kay_participant_is_primary_slot(struct ieee802_1x_kay *kay,
+						const struct mka_key_name *ckn);
+bool ieee802_1x_kay_participant_carries_traffic(struct ieee802_1x_kay *kay,
+						const struct mka_key_name *ckn);
+bool ieee802_1x_kay_other_carrier_exists(struct ieee802_1x_kay *kay,
+					 const struct mka_key_name *excl_ckn);
+bool ieee802_1x_kay_drain_participant(struct ieee802_1x_kay *kay,
+				      const struct mka_key_name *ckn);
+void ieee802_1x_kay_set_primary_slot(struct ieee802_1x_kay *kay,
+				     const struct mka_key_name *ckn,
+				     bool is_primary);
 void ieee802_1x_kay_mka_participate(struct ieee802_1x_kay *kay,
 				    struct mka_key_name *ckn,
 				    bool status);
