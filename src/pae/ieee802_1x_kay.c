@@ -549,6 +549,8 @@ ieee802_1x_kay_init_receive_sa(struct receive_sc *psc, u8 an, u32 lowest_pn,
 
 
 static void ieee802_1x_kay_deinit_data_key(struct data_key *pkey);
+static void ieee802_1x_delete_transmit_sa(struct ieee802_1x_kay *kay,
+					  struct transmit_sa *sa);
 static int ieee802_1x_kay_install_warm_rxsas(
 	struct ieee802_1x_mka_participant *participant,
 	struct data_key *sa_key);
@@ -2854,7 +2856,31 @@ static void enforce_single_principal(struct ieee802_1x_kay *kay)
 		return;
 	}
 
-	/* Hand transmit over to the selected owner. */
+	/* Hand transmit over to the selected owner.
+	 *
+	 * Clear the previous owner's ownership FIRST: the CP-driven SA helpers
+	 * (create_sas/enable_tx_sas/...) resolve key identifiers through
+	 * ieee802_1x_kay_get_principal_participant(), which returns the first
+	 * secy_installed participant. If the previous owner were still marked
+	 * installed while owner_adopt_transmit() drives the CP, those helpers
+	 * could operate on the wrong participant's SAs. Disable the previous
+	 * owner's transmit SAs too, so transmit is switched deterministically
+	 * (exactly one enabled transmit SA) rather than relying on the driver's
+	 * encoding-SA selection. Its receive SAs are retained (warm standby, or
+	 * draining). */
+	if (installed) {
+		struct transmit_sa *txsa, *pre_txsa;
+
+		installed->secy_installed = false;
+		installed->principal = false;
+		if (installed->txsc) {
+			dl_list_for_each_safe(txsa, pre_txsa,
+					      &installed->txsc->sa_list,
+					      struct transmit_sa, list)
+				ieee802_1x_delete_transmit_sa(kay, txsa);
+		}
+	}
+
 	best->secy_installed = true;
 	best->principal = true;
 	best->draining = false;
@@ -2865,12 +2891,12 @@ static void enforce_single_principal(struct ieee802_1x_kay *kay)
 
 	dl_list_for_each(p, &kay->participant_list,
 			 struct ieee802_1x_mka_participant, list) {
-		if (p == best)
+		if (p == best || p == installed)
 			continue;
-		/* Superseded participants revert to (or remain) warm standbys.
-		 * A participant whose CAK is being retired keeps its draining
-		 * flag, set by the caller, so its receive SAs are retained until
-		 * the drain timer deletes it. */
+		/* Any other participant is a warm standby (receive only). A
+		 * participant whose CAK is being retired keeps its draining flag,
+		 * set by the caller, so its receive SAs are retained until the
+		 * drain timer deletes it. */
 		if (!p->draining) {
 			p->secy_installed = false;
 			p->principal = false;
