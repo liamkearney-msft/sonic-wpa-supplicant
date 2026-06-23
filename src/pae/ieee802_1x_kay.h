@@ -269,8 +269,6 @@ bool ieee802_1x_kay_participant_exists(struct ieee802_1x_kay *kay,
 				       const struct mka_key_name *ckn);
 bool ieee802_1x_kay_participant_is_primary_slot(struct ieee802_1x_kay *kay,
 						const struct mka_key_name *ckn);
-bool ieee802_1x_kay_participant_carries_traffic(struct ieee802_1x_kay *kay,
-						const struct mka_key_name *ckn);
 bool ieee802_1x_kay_other_carrier_exists(struct ieee802_1x_kay *kay,
 					 const struct mka_key_name *excl_ckn);
 bool ieee802_1x_kay_drain_participant(struct ieee802_1x_kay *kay,

@@ -4580,25 +4580,6 @@ bool ieee802_1x_kay_participant_is_primary_slot(struct ieee802_1x_kay *kay,
 
 
 /**
- * ieee802_1x_kay_participant_carries_traffic - True if the participant with the
- * given CKN currently has an established, usable SAK (live peers and at least
- * one SAK), i.e. it can carry or receive traffic now. Used to verify a backup
- * carrier exists before a key rotation.
- */
-bool ieee802_1x_kay_participant_carries_traffic(struct ieee802_1x_kay *kay,
-						const struct mka_key_name *ckn)
-{
-	struct ieee802_1x_mka_participant *p;
-
-	if (!kay || !ckn)
-		return false;
-	p = ieee802_1x_kay_get_participant(kay, ckn->name, ckn->len);
-	return p && !p->draining && !dl_list_empty(&p->live_peers) &&
-		!dl_list_empty(&p->sak_list);
-}
-
-
-/**
  * ieee802_1x_kay_other_carrier_exists - True if some participant *other* than
  * the one named by excl_ckn currently has an established, usable SAK (live
  * peers and a SAK, not draining). Used to confirm a backup carrier is present
