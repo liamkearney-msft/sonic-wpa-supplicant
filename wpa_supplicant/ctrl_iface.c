@@ -10535,6 +10535,7 @@ static int wpa_supplicant_ctrl_iface_mka_update_key(
 	const char *pos, *end;
 	size_t len;
 	int ret = -1;
+	bool same_ckn, old_is_primary;
 
 	if (!wpa_s->kay) {
 		wpa_printf(MSG_ERROR, "MKA_UPDATE_KEY: KaY not initialized");
@@ -10601,19 +10602,20 @@ static int wpa_supplicant_ctrl_iface_mka_update_key(
 	}
 
 	/*
-	 * Validate against current KaY state before the destructive delete so a
-	 * bad request cannot strand the session. The old participant must exist,
-	 * and the new CKN must not collide with a different existing participant
-	 * (e.g. the fallback), which would make the create below fail after the
-	 * old key has already been removed.
+	 * Validate against current KaY state before any change. The old
+	 * participant must exist, and the new CKN must not collide with a
+	 * different existing participant (e.g. the fallback).
 	 */
 	if (!ieee802_1x_kay_participant_exists(wpa_s->kay, &old_ckn)) {
 		wpa_printf(MSG_ERROR,
 			   "MKA_UPDATE_KEY: old_ckn participant not found");
 		goto done;
 	}
-	if ((ckn->len != old_ckn.len ||
-	     os_memcmp(ckn->name, old_ckn.name, ckn->len) != 0) &&
+
+	same_ckn = (ckn->len == old_ckn.len &&
+		    os_memcmp(ckn->name, old_ckn.name, ckn->len) == 0);
+
+	if (!same_ckn &&
 	    ieee802_1x_kay_participant_exists(wpa_s->kay, ckn)) {
 		wpa_printf(MSG_ERROR,
 			   "MKA_UPDATE_KEY: ckn already in use by another participant");
@@ -10621,19 +10623,70 @@ static int wpa_supplicant_ctrl_iface_mka_update_key(
 	}
 
 	/*
-	 * This is not atomic: the old participant is removed first so its
-	 * Association Numbers are freed for the new key, then the replacement is
-	 * created. If the create fails, the session continues on the fallback
-	 * participant, which the caller is required to have established before
-	 * rotating the primary key.
+	 * Carrier guard: there must be another established participant able to
+	 * carry traffic across the rotation. For a primary rotation that is the
+	 * fallback; for a fallback rotation that is the primary. Without it the
+	 * rotation would leave the link with no usable key, so reject it and
+	 * leave the live session untouched.
 	 */
-	ieee802_1x_kay_delete_mka(wpa_s->kay, &old_ckn);
+	old_is_primary = ieee802_1x_kay_participant_is_primary_slot(wpa_s->kay,
+								   &old_ckn);
+	if (!ieee802_1x_kay_other_carrier_exists(wpa_s->kay, &old_ckn)) {
+		if (old_is_primary)
+			wpa_printf(MSG_ERROR,
+				   "MKA_UPDATE_KEY: no established fallback to carry traffic during primary rotation");
+		else
+			wpa_printf(MSG_ERROR,
+				   "MKA_UPDATE_KEY: primary session not active; cannot rotate fallback");
+		goto done;
+	}
 
-	if (ieee802_1x_kay_create_mka(wpa_s->kay, ckn, cak, 0, PSK, false))
-		ret = 0;
-	else
-		wpa_printf(MSG_ERROR,
-			   "MKA_UPDATE_KEY: failed to create replacement participant; session remains on fallback");
+	if (old_is_primary) {
+		/*
+		 * Primary rollover. The fallback (the other carrier, verified
+		 * above) takes over transmit. The outgoing primary is drained
+		 * in place — its receive SAs stay installed so the peer, which
+		 * has not yet rolled and is still transmitting on the old
+		 * primary SAK, continues to be received until it rolls too. The
+		 * drain timer deletes it after MKA Life Time (§9.3.2). The new
+		 * primary is created and marked as the primary slot, so transmit
+		 * returns to it once it establishes on both ends.
+		 *
+		 * A new CKN is required (the old participant lingers while
+		 * draining, so the same CKN cannot be recreated).
+		 */
+		if (same_ckn) {
+			wpa_printf(MSG_ERROR,
+				   "MKA_UPDATE_KEY: primary rotation requires a new ckn");
+			goto done;
+		}
+
+		ieee802_1x_kay_drain_participant(wpa_s->kay, &old_ckn);
+
+		if (ieee802_1x_kay_create_mka(wpa_s->kay, ckn, cak, 0, PSK,
+					      false)) {
+			ieee802_1x_kay_set_primary_slot(wpa_s->kay, ckn, true);
+			ret = 0;
+		} else {
+			wpa_printf(MSG_ERROR,
+				   "MKA_UPDATE_KEY: failed to create replacement primary; traffic remains on fallback");
+		}
+	} else {
+		/*
+		 * Fallback rollover. The fallback carries no traffic while the
+		 * primary is the transmit owner, so it can be deleted and
+		 * recreated immediately, freeing its Association Numbers for the
+		 * new key. The primary session is unaffected.
+		 */
+		ieee802_1x_kay_delete_mka(wpa_s->kay, &old_ckn);
+
+		if (ieee802_1x_kay_create_mka(wpa_s->kay, ckn, cak, 0, PSK,
+					      false))
+			ret = 0;
+		else
+			wpa_printf(MSG_ERROR,
+				   "MKA_UPDATE_KEY: failed to create replacement fallback");
+	}
 
 done:
 	os_free(cak);
