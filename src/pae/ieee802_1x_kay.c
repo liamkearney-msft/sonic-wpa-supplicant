@@ -2998,14 +2998,23 @@ static void ieee802_1x_participant_timer(void *eloop_ctx, void *timeout_ctx)
 	wpa_printf(MSG_DEBUG, "KaY: Participant timer (ifname=%s)",
 		   kay->if_name);
 
-	/* Warm dual-SAK: a draining participant (former transmit owner) keeps
-	 * its receive SAs so a peer that has not yet switched off its SAK is
-	 * still received. Per IEEE 802.1X-2020 §9.3.2, retain it for MKA Life
-	 * Time after draining began, then delete it. */
+	/* Warm dual-SAK: a draining participant (former transmit owner whose CAK
+	 * was rotated away) keeps its receive SAs so the peer — which has not yet
+	 * rolled and is still transmitting on the old SAK — is still received.
+	 * Retire it once the peer has migrated off it (its live peer list has
+	 * emptied), bounded by a safety maximum so it cannot linger forever if
+	 * the peer keeps an idle participant alive. The maximum comfortably
+	 * outlasts the peer's own liveness detection (MKA Life Time) plus its
+	 * switch to the fallback. */
 	if (participant->draining) {
-		if (now - participant->drain_started >= MKA_LIFE_TIME / 1000) {
+		bool peer_gone = dl_list_empty(&participant->live_peers);
+		bool max_elapsed = (now - participant->drain_started) >=
+			(time_t) (3 * MKA_LIFE_TIME / 1000);
+
+		if (peer_gone || max_elapsed) {
 			wpa_printf(MSG_DEBUG,
-				   "KaY: Drained participant retired after MKA Life Time");
+				   "KaY: Drained participant retired (%s)",
+				   peer_gone ? "peer migrated" : "max drain time");
 			goto delete_mka;
 		}
 	}
@@ -3084,7 +3093,21 @@ static void ieee802_1x_participant_timer(void *eloop_ctx, void *timeout_ctx)
 			participant->orx = false;
 			participant->is_key_server = false;
 			participant->is_elected = false;
-			if (participant->secy_installed) {
+			if (participant->secy_installed &&
+			    ieee802_1x_kay_other_carrier_exists(kay,
+								&participant->ckn)) {
+				/* Warm dual-SAK: the transmit owner lost its
+				 * peer (e.g. the peer rolled its CAK and the
+				 * session died). A warm fallback is available,
+				 * so hand transmit to it rather than tearing the
+				 * SecY down. The peer performs the symmetric
+				 * switch, so both ends ride the fallback. */
+				wpa_printf(MSG_DEBUG,
+					   "KaY: Transmit owner lost peer; failing over to fallback");
+				participant->secy_installed = false;
+				participant->principal = false;
+				enforce_single_principal(kay);
+			} else if (participant->secy_installed) {
 				kay->authenticated = false;
 				kay->secured = false;
 				kay->failed = false;
@@ -3136,8 +3159,13 @@ static void ieee802_1x_participant_timer(void *eloop_ctx, void *timeout_ctx)
 		participant->new_sak = false;
 	}
 
-	if (participant->retry_count < MAX_RETRY_CNT ||
-	    participant->mode == PSK) {
+	/* Warm dual-SAK: a draining participant goes silent (stops sending
+	 * MKPDUs) so the peer's liveness timer expires and the peer fails over
+	 * to the fallback. Its receive SAs remain installed (drain) so the peer
+	 * is still received until it migrates. Other participants send normally. */
+	if (!participant->draining &&
+	    (participant->retry_count < MAX_RETRY_CNT ||
+	     participant->mode == PSK)) {
 		ieee802_1x_participant_send_mkpdu(participant);
 		participant->retry_count++;
 	}
