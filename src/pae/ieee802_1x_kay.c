@@ -3512,6 +3512,20 @@ int ieee802_1x_kay_create_sas(struct ieee802_1x_kay *kay,
 	}
 
 	dl_list_for_each(rxsc, &principal->rxsc_list, struct receive_sc, list) {
+		/* Warm dual-SAK: when transmit ownership is adopted by a
+		 * participant that was a warm standby, its receive SA for this
+		 * SAK is already installed (directly, via
+		 * ieee802_1x_kay_install_warm_rxsas) at this AN. Recreating it
+		 * would issue a redundant delete+create of an identical SA to
+		 * the SecY/driver -- which, on SONiC, clears and rewrites the
+		 * MACSEC_*_SA State DB entries and can make MACsec Orch touch
+		 * the hardware for no change. If an identical receive SA (same
+		 * AN, same SAK) is already present, keep it as is; the separate
+		 * enable step (ieee802_1x_kay_enable_rx_sas) still runs. */
+		rxsa = lookup_rxsa_by_an(rxsc, latest_sak->an);
+		if (rxsa && rxsa->pkey == latest_sak)
+			continue;
+
 		while ((rxsa = lookup_rxsa_by_an(rxsc, latest_sak->an)) != NULL)
 			ieee802_1x_delete_receive_sa(kay, rxsa);
 
