@@ -152,6 +152,15 @@ struct ieee802_1x_mka_participant {
 	u32 retry_count;
 
 	struct ieee802_1x_kay *kay;
+
+	/* Shared-SC rollover: only the secy_installed participant owns the
+	 * driver-level TxSC/RxSCs. Non-installed participants share the
+	 * installed participant's SCs and install their SAs on them. */
+	bool secy_installed;
+	/* IEEE 802.1X-2020 §9.5: Track when this participant started
+	 * participating to enforce MKA Life Time delay before distributing
+	 * a new SAK. */
+	time_t started_participating;
 };
 
 struct ieee802_1x_mka_hdr {

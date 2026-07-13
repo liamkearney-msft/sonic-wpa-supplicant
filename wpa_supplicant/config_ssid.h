@@ -963,6 +963,23 @@ struct wpa_ssid {
 	 * mka_psk_set - Whether mka_ckn and mka_cak are set
 	 */
 	u8 mka_psk_set;
+
+	/**
+	 * mka_ckn2 - MKA pre-shared backup CKN
+	 */
+	size_t mka_ckn2_len;
+	u8 mka_ckn2[MACSEC_CKN_MAX_LEN];
+
+	/**
+	 * mka_cak2 - MKA pre-shared backup CAK
+	 */
+	size_t mka_cak2_len;
+	u8 mka_cak2[MACSEC_CAK_MAX_LEN];
+
+	/**
+	 * mka_psk_set2 - Whether mka_ckn2 and mka_cak2 are set
+	 */
+	u8 mka_psk_set2;
 #endif /* CONFIG_MACSEC */
 
 #ifdef CONFIG_HS20
