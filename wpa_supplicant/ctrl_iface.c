@@ -10621,11 +10621,25 @@ static int wpa_supplicant_ctrl_iface_mka_update_key(
 	}
 
 	/*
+	 * The old participant is deleted before the replacement is created, so
+	 * if it currently owns the SecY there must be a fallback participant
+	 * with a live peer ready to take the session over hitlessly. Reject the
+	 * request otherwise instead of stranding the data plane - the command
+	 * is issued from the CLI, so we cannot assume the caller established a
+	 * viable fallback first.
+	 */
+	if (!ieee802_1x_kay_can_rotate_participant(wpa_s->kay, &old_ckn)) {
+		wpa_printf(MSG_ERROR,
+			   "MKA_UPDATE_KEY: no live fallback participant to carry the session; establish a fallback CAK before rotating the active key");
+		goto done;
+	}
+
+	/*
 	 * This is not atomic: the old participant is removed first so its
-	 * Association Numbers are freed for the new key, then the replacement is
-	 * created. If the create fails, the session continues on the fallback
-	 * participant, which the caller is required to have established before
-	 * rotating the primary key.
+	 * Association Numbers are freed for the new key, then the replacement
+	 * is created. The check above guarantees a live fallback participant is
+	 * present, so the session keeps flowing on it (hitless SecY handoff)
+	 * while the new primary key re-establishes.
 	 */
 	ieee802_1x_kay_delete_mka(wpa_s->kay, &old_ckn);
 

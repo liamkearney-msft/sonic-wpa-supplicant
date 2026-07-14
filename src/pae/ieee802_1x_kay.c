@@ -4622,6 +4622,56 @@ bool ieee802_1x_kay_participant_exists(struct ieee802_1x_kay *kay,
 
 
 /**
+ * ieee802_1x_kay_can_rotate_participant - Check that replacing the participant
+ * with the given CKN will not strand the protected data session.
+ *
+ * MKA_UPDATE_KEY removes the old participant before creating its replacement
+ * (their Association Numbers must not overlap). If the old participant
+ * currently owns the SecY - i.e. it carries the protected traffic - and no
+ * other participant has a live peer to take the SecY over, that removal tears
+ * the datapath down and traffic is lost until the new participant fully
+ * re-establishes. Because MKA_UPDATE_KEY is driven from the command line we
+ * must not rely on the caller having first established a viable fallback;
+ * verify one exists here.
+ *
+ * Returns true if the rotation is safe: either the old participant is not the
+ * SecY owner (another participant is already carrying the session), or a
+ * fallback participant with a live peer is available to take the SecY over
+ * hitlessly (matching ieee802_1x_kay_transfer_secy_to_standby()).
+ */
+bool ieee802_1x_kay_can_rotate_participant(struct ieee802_1x_kay *kay,
+					   const struct mka_key_name *old_ckn)
+{
+	struct ieee802_1x_mka_participant *old;
+	struct ieee802_1x_mka_participant *p;
+
+	if (!kay || !old_ckn)
+		return false;
+
+	old = ieee802_1x_kay_get_participant(kay, old_ckn->name, old_ckn->len);
+	if (!old)
+		return false;
+
+	/* If the old participant does not own the SecY, the active session is
+	 * carried by another participant and removing the old one is safe. */
+	if (!old->secy_installed)
+		return true;
+
+	/* Otherwise a standby participant with a live peer must be available to
+	 * take the SecY over without reprogramming the datapath key. */
+	dl_list_for_each(p, &kay->participant_list,
+			 struct ieee802_1x_mka_participant, list) {
+		if (p == old)
+			continue;
+		if (!dl_list_empty(&p->live_peers))
+			return true;
+	}
+
+	return false;
+}
+
+
+/**
  * ieee802_1x_kay_mka_participate -
  */
 void ieee802_1x_kay_mka_participate(struct ieee802_1x_kay *kay,

@@ -267,6 +267,8 @@ void ieee802_1x_kay_delete_mka(struct ieee802_1x_kay *kay,
 			       struct mka_key_name *ckn);
 bool ieee802_1x_kay_participant_exists(struct ieee802_1x_kay *kay,
 				       const struct mka_key_name *ckn);
+bool ieee802_1x_kay_can_rotate_participant(struct ieee802_1x_kay *kay,
+					   const struct mka_key_name *old_ckn);
 void ieee802_1x_kay_mka_participate(struct ieee802_1x_kay *kay,
 				    struct mka_key_name *ckn,
 				    bool status);
