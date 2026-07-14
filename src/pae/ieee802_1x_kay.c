@@ -1863,6 +1863,27 @@ static void ieee802_1x_kay_init_data_key(struct data_key *pkey)
 
 
 /**
+ * ieee802_1x_kay_install_dist_sak - Signal the CP to install a distributed SAK
+ * into the SecY. Only the principal (SecY-owning) participant installs SAKs.
+ */
+static void ieee802_1x_kay_install_dist_sak(struct ieee802_1x_kay *kay,
+					    struct data_key *sa_key,
+					    unsigned int cs_id, u8 offset,
+					    u8 an)
+{
+	ieee802_1x_cp_set_ciphersuite(kay->cp, cs_id);
+	ieee802_1x_cp_sm_step(kay->cp);
+	ieee802_1x_cp_set_offset(kay->cp, offset);
+	ieee802_1x_cp_sm_step(kay->cp);
+	ieee802_1x_cp_set_distributedki(kay->cp, &sa_key->key_identifier);
+	ieee802_1x_cp_set_distributedan(kay->cp, an);
+	ieee802_1x_cp_signal_newsak(kay->cp);
+	ieee802_1x_cp_sm_step(kay->cp);
+	sa_key->installed = true;
+}
+
+
+/**
  * ieee802_1x_kay_decode_dist_sak_body -
  */
 static int
@@ -1945,16 +1966,6 @@ ieee802_1x_mka_decode_dist_sak_body(
 
 	body = (struct ieee802_1x_mka_dist_sak_body *)mka_msg;
 	ieee802_1x_mka_dump_dist_sak_body(body);
-	dl_list_for_each(sa_key, &participant->sak_list, struct data_key, list)
-	{
-		if (os_memcmp(sa_key->key_identifier.mi,
-			      participant->current_peer_id.mi, MI_LEN) == 0 &&
-		    sa_key->key_identifier.kn == be_to_host32(body->kn)) {
-			wpa_printf(MSG_DEBUG,
-				   "KaY: SAK has already been installed - do not set it again");
-			return 0;
-		}
-	}
 
 	if (body_len == 28) {
 		sak_len = DEFAULT_SA_KEY_LEN;
@@ -1975,6 +1986,37 @@ ieee802_1x_mka_decode_dist_sak_body(
 		sak_len = cs->sak_len;
 		wrap_sak = body->sak + CS_ID_LEN;
 		kay->macsec_csindex = idx;
+	}
+
+	dl_list_for_each(sa_key, &participant->sak_list, struct data_key, list)
+	{
+		if (os_memcmp(sa_key->key_identifier.mi,
+			      participant->current_peer_id.mi, MI_LEN) != 0 ||
+		    sa_key->key_identifier.kn != be_to_host32(body->kn))
+			continue;
+
+		/*
+		 * We already hold this SAK. If it is installed, or we are a
+		 * standby that only records SAKs, there is nothing more to do.
+		 * But a standby records a distributed SAK without installing it
+		 * into the SecY; if it was later promoted to principal (e.g. a
+		 * hitless failover) the SAK is present but was never programmed.
+		 * Install it now rather than skipping, otherwise the key server
+		 * keeps re-distributing a SAK the peer never starts using.
+		 */
+		if (sa_key->installed || !participant->secy_installed) {
+			wpa_printf(MSG_DEBUG,
+				   "KaY: SAK has already been installed - do not set it again");
+			return 0;
+		}
+
+		wpa_printf(MSG_DEBUG,
+			   "KaY: Installing SAK recorded while standby, now promoted to principal");
+		ieee802_1x_kay_install_dist_sak(kay, sa_key, cs->id,
+						body->confid_offset, body->dan);
+		participant->to_use_sak = true;
+		peer->expire = time(NULL) + MKA_LIFE_TIME / 1000;
+		return 0;
 	}
 
 	unwrap_sak = os_zalloc(sak_len);
@@ -2021,17 +2063,9 @@ ieee802_1x_mka_decode_dist_sak_body(
 	/* IEEE 802.1X-2020 §9.10: Only SAKs received by the principal
 	 * actor are installed to the SecY. Non-principal (standby)
 	 * participants record the SAK but do not signal CP. */
-	if (participant->secy_installed) {
-		ieee802_1x_cp_set_ciphersuite(kay->cp, cs->id);
-		ieee802_1x_cp_sm_step(kay->cp);
-		ieee802_1x_cp_set_offset(kay->cp, body->confid_offset);
-		ieee802_1x_cp_sm_step(kay->cp);
-		ieee802_1x_cp_set_distributedki(kay->cp,
-						      &sa_key->key_identifier);
-		ieee802_1x_cp_set_distributedan(kay->cp, body->dan);
-		ieee802_1x_cp_signal_newsak(kay->cp);
-		ieee802_1x_cp_sm_step(kay->cp);
-	}
+	if (participant->secy_installed)
+		ieee802_1x_kay_install_dist_sak(kay, sa_key, cs->id,
+						body->confid_offset, body->dan);
 
 	kay->rcvd_keys++;
 	participant->to_use_sak = true;
@@ -2516,6 +2550,7 @@ ieee802_1x_kay_generate_new_sak(struct ieee802_1x_mka_participant *participant)
 	ieee802_1x_cp_set_distributedan(kay->cp, sa_key->an);
 	ieee802_1x_cp_signal_newsak(kay->cp);
 	ieee802_1x_cp_sm_step(kay->cp);
+	sa_key->installed = true;
 
 	dl_list_for_each(peer, &participant->live_peers,
 			 struct ieee802_1x_kay_peer, list)

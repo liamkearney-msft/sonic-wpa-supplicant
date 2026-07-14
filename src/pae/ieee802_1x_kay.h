@@ -73,6 +73,13 @@ struct data_key {
 	bool rx_latest;
 	bool tx_latest;
 
+	/* Whether this SAK has been signalled to the CP / installed into the
+	 * SecY. A standby (non-principal) participant records a distributed SAK
+	 * without installing it; if it is later promoted to principal the SAK
+	 * must still be installed, so the "already recorded" check must not
+	 * mistake a recorded-but-uninstalled SAK for an installed one. */
+	bool installed;
+
 	int user;
 
 	struct dl_list list;
