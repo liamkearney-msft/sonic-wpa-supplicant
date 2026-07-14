@@ -539,6 +539,9 @@ ieee802_1x_kay_init_receive_sa(struct receive_sc *psc, u8 an, u32 lowest_pn,
 
 
 static void ieee802_1x_kay_deinit_data_key(struct data_key *pkey);
+static bool
+ieee802_1x_kay_has_other_participant(struct ieee802_1x_kay *kay,
+				     struct ieee802_1x_mka_participant *self);
 
 /**
  * ieee802_1x_kay_deinit_receive_sa -
@@ -1021,6 +1024,32 @@ ieee802_1x_mka_decode_basic_body(struct ieee802_1x_kay *kay, const u8 *mka_msg,
 						   &body->actor_sci);
 		if (peer) {
 			time_t new_expire;
+
+			/*
+			 * The MKPDU carried a valid ICV, so the sender holds our
+			 * CAK - this is our peer legitimately rotating its MI,
+			 * not an attacker. When this device runs the primary +
+			 * fallback model (a sibling participant shares the actor
+			 * SCI), ignoring the MKPDUs until the old MI ages out
+			 * expires the peer and tears down the fallback CA at the
+			 * moment it must carry a hitless failover. Instead adopt
+			 * the new MI in place, keep the peer live, and process
+			 * the MKPDU normally.
+			 */
+			if (ieee802_1x_kay_has_other_participant(kay,
+								 participant)) {
+				wpa_printf(MSG_DEBUG,
+					   "KaY: Peer rotated MI on shared SCI - adopt new MI in place");
+				os_memcpy(peer->mi, body->actor_mi, MI_LEN);
+				peer->mn = be_to_host32(body->actor_mn);
+				peer->macsec_desired = body->macsec_desired;
+				peer->macsec_capability =
+					body->macsec_capability;
+				peer->is_key_server = body->key_server;
+				peer->key_server_priority = body->priority;
+				peer->expire = time(NULL) + MKA_LIFE_TIME / 1000;
+				return participant;
+			}
 
 			wpa_printf(MSG_WARNING,
 				   "KaY: duplicated SCI detected - maybe active attacker or peer selected new MI - ignore MKPDU");
@@ -3132,6 +3161,14 @@ ieee802_1x_kay_transfer_secy_to_standby(
 	 */
 	standby->secy_installed = true;
 	standby->principal = true;
+	/*
+	 * Clear any stale new-SAK request. A standby Key Server sets new_sak
+	 * when it is first elected, but never clears it because SAK generation
+	 * is gated on secy_installed; if left set, promotion would immediately
+	 * rekey. We want the promoted participant to keep using the inherited
+	 * shared SAK, so suppress that rekey here.
+	 */
+	standby->new_sak = false;
 	leaving->secy_installed = false;
 
 	return standby;
@@ -4182,6 +4219,20 @@ static int ieee802_1x_kay_decode_mkpdu(struct ieee802_1x_kay *kay,
 				wpa_printf(MSG_INFO,
 					   "KaY: Discarding Rx MKPDU: Live Peer not sending SAK-USE");
 				return -1;
+			} else {
+				/*
+				 * We have a SAK in use but the peer has not yet
+				 * acknowledged with SAK-USE. Keep the peer alive
+				 * during this grace window (up to
+				 * MAX_MISSING_SAK_USE MKPDUs) instead of letting
+				 * the 6 s watchdog expire it. This matters right
+				 * after a failover handoff: the newly promoted
+				 * peer takes a moment to start advertising SAK-USE
+				 * for the inherited shared SAK, and expiring it in
+				 * that window tears the CA down and defeats the
+				 * hitless failover.
+				 */
+				peer->expire = time(NULL) + MKA_LIFE_TIME / 1000;
 			}
 		} else {
 			peer->missing_sak_use_count = 0;
