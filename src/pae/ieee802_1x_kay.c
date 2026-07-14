@@ -539,9 +539,6 @@ ieee802_1x_kay_init_receive_sa(struct receive_sc *psc, u8 an, u32 lowest_pn,
 
 
 static void ieee802_1x_kay_deinit_data_key(struct data_key *pkey);
-static bool
-ieee802_1x_kay_is_shared_receive_sc(struct ieee802_1x_mka_participant *participant,
-				    const struct receive_sc *psc);
 
 /**
  * ieee802_1x_kay_deinit_receive_sa -
@@ -605,15 +602,53 @@ ieee802_1x_kay_deinit_receive_sc(
 	struct ieee802_1x_mka_participant *participant, struct receive_sc *psc)
 {
 	struct receive_sa *psa, *pre_sa;
+	struct ieee802_1x_mka_participant *other;
+	struct receive_sc *dst = NULL;
 
 	wpa_printf(MSG_DEBUG, "KaY: Delete receive SC");
+
+	/*
+	 * If another participant shares this RxSC (primary + fallback CAK
+	 * sharing a single SecY, same peer SCI), hand the installed receive
+	 * SAs over to it rather than removing them from the SecY. This keeps
+	 * the active SAK decrypting the peer's traffic across a hitless
+	 * failover, matching the shared-SAK model used by Arista EOS.
+	 */
+	dl_list_for_each(other, &participant->kay->participant_list,
+			 struct ieee802_1x_mka_participant, list) {
+		struct receive_sc *rxsc;
+
+		if (other == participant)
+			continue;
+		dl_list_for_each(rxsc, &other->rxsc_list, struct receive_sc,
+				 list) {
+			if (sci_equal(&rxsc->sci, &psc->sci)) {
+				dst = rxsc;
+				break;
+			}
+		}
+		if (dst)
+			break;
+	}
+
+	if (dst) {
+		dl_list_for_each_safe(psa, pre_sa, &psc->sa_list,
+				      struct receive_sa, list) {
+			dl_list_del(&psa->list);
+			psa->sc = dst;
+			dl_list_add_tail(&dst->sa_list, &psa->list);
+		}
+		dl_list_del(&psc->list);
+		os_free(psc);
+		return;
+	}
+
 	dl_list_for_each_safe(psa, pre_sa, &psc->sa_list, struct receive_sa,
 			      list)
 		ieee802_1x_delete_receive_sa(participant->kay, psa);
 
 	dl_list_del(&psc->list);
-	if (!ieee802_1x_kay_is_shared_receive_sc(participant, psc))
-		secy_delete_receive_sc(participant->kay, psc);
+	secy_delete_receive_sc(participant->kay, psc);
 	os_free(psc);
 }
 
@@ -679,27 +714,6 @@ ieee802_1x_kay_insert_receive_sc(struct ieee802_1x_mka_participant *participant,
 	}
 	if (!found)
 		dl_list_add(&participant->rxsc_list, &new_rxsc->list);
-}
-
-
-static bool
-ieee802_1x_kay_is_shared_receive_sc(struct ieee802_1x_mka_participant *participant,
-				    const struct receive_sc *psc)
-{
-	struct ieee802_1x_mka_participant *other;
-	struct receive_sc *rxsc;
-
-	dl_list_for_each(other, &participant->kay->participant_list,
-			 struct ieee802_1x_mka_participant, list) {
-		if (other == participant)
-			continue;
-		dl_list_for_each(rxsc, &other->rxsc_list, struct receive_sc, list) {
-			if (sci_equal(&rxsc->sci, &psc->sci))
-				return true;
-		}
-	}
-
-	return false;
 }
 
 
@@ -2918,6 +2932,107 @@ static void enforce_single_principal(struct ieee802_1x_kay *kay)
 	}
 }
 
+
+/**
+ * ieee802_1x_kay_transfer_secy_to_standby - Hitless SecY handoff on peer loss
+ *
+ * When the principal (the SecY owner) loses all of its live peers - e.g. the
+ * peer's primary CAK is removed or rekeyed and its MKPDUs stop authenticating -
+ * hand the active SAK and SecY ownership to a standby participant that still
+ * has a live peer, WITHOUT tearing down the installed SAs. The transmit SAs
+ * for the active SAK are moved onto the standby's TxSC (both participants share
+ * one SecY TxSC, so the SAs stay programmed in hardware); the receive SAs have
+ * already been handed to the standby's shared RxSC by
+ * ieee802_1x_kay_deinit_receive_sc() when the lost peer's RxSC was torn down.
+ * Traffic therefore keeps flowing on the existing SAK, and the promoted standby
+ * subsequently performs a normal make-before-break rekey (new_sak) to roll to a
+ * fresh SAK under its own CA.
+ *
+ * This mirrors Arista EOS, which keeps a single shared SAK across the primary
+ * and fallback CAKs and hands the SecY over seamlessly on failover instead of
+ * reprogramming the datapath key.
+ *
+ * Returns the standby that took ownership, or NULL if none is available (in
+ * which case the caller performs the ordinary destructive teardown).
+ */
+static struct ieee802_1x_mka_participant *
+ieee802_1x_kay_transfer_secy_to_standby(
+	struct ieee802_1x_kay *kay,
+	struct ieee802_1x_mka_participant *leaving)
+{
+	struct ieee802_1x_mka_participant *standby = NULL;
+	struct ieee802_1x_mka_participant *p;
+	struct data_key *sak, *pre_sak;
+	struct transmit_sa *txsa, *pre_txsa;
+
+	if (!leaving->secy_installed)
+		return NULL;
+
+	dl_list_for_each(p, &kay->participant_list,
+			 struct ieee802_1x_mka_participant, list) {
+		if (p == leaving)
+			continue;
+		if (!dl_list_empty(&p->live_peers)) {
+			standby = p;
+			break;
+		}
+	}
+	if (!standby)
+		return NULL;
+
+	wpa_printf(MSG_DEBUG,
+		   "KaY: Hitless failover - transferring active SAK and SecY ownership to standby participant");
+
+	/* Move the active SAK(s) so the standby owns them for SA rotation and
+	 * next-AN selection (make-before-break rekey). */
+	dl_list_for_each_safe(sak, pre_sak, &leaving->sak_list,
+			      struct data_key, list) {
+		dl_list_del(&sak->list);
+		dl_list_add_tail(&standby->sak_list, &sak->list);
+	}
+	standby->new_key = leaving->new_key;
+	leaving->new_key = NULL;
+
+	/* Move installed transmit SAs onto the standby's TxSC. Both
+	 * participants share a single SecY TxSC (same actor SCI), so the SAs
+	 * remain programmed in the SecY - only the KaY bookkeeping owner
+	 * changes. */
+	if (leaving->txsc && standby->txsc) {
+		dl_list_for_each_safe(txsa, pre_txsa, &leaving->txsc->sa_list,
+				      struct transmit_sa, list) {
+			dl_list_del(&txsa->list);
+			txsa->sc = standby->txsc;
+			dl_list_add_tail(&standby->txsc->sa_list, &txsa->list);
+		}
+		standby->txsc->encoding_sa = leaving->txsc->encoding_sa;
+		standby->txsc->enciphering_sa = leaving->txsc->enciphering_sa;
+		standby->txsc->transmitting = leaving->txsc->transmitting;
+	}
+
+	/* Preserve SAK-use signalling state so the standby keeps advertising
+	 * the active SAK in its MKPDUs until the rekey completes. */
+	os_memcpy(&standby->lki, &leaving->lki, sizeof(standby->lki));
+	os_memcpy(&standby->oki, &leaving->oki, sizeof(standby->oki));
+	standby->lan = leaving->lan;
+	standby->oan = leaving->oan;
+	standby->lrx = leaving->lrx;
+	standby->ltx = leaving->ltx;
+	standby->orx = leaving->orx;
+	standby->otx = leaving->otx;
+	standby->to_use_sak = leaving->to_use_sak;
+	standby->advised_desired = leaving->advised_desired;
+	standby->advised_capability = leaving->advised_capability;
+	standby->to_dist_sak = false;
+
+	/* Transfer SecY ownership and trigger a make-before-break rekey. */
+	standby->secy_installed = true;
+	standby->principal = true;
+	standby->new_sak = true;
+	leaving->secy_installed = false;
+
+	return standby;
+}
+
 static const u8 pae_group_addr[ETH_ALEN] = {
 	0x01, 0x80, 0xc2, 0x00, 0x00, 0x03
 };
@@ -3032,6 +3147,7 @@ static void ieee802_1x_participant_timer(void *eloop_ctx, void *timeout_ctx)
 	bool key_server_removed;
 	struct receive_sc *rxsc, *pre_rxsc;
 	struct transmit_sa *txsa, *pre_txsa;
+	struct ieee802_1x_mka_participant *promoted;
 
 	participant = (struct ieee802_1x_mka_participant *)eloop_ctx;
 	kay = participant->kay;
@@ -3101,6 +3217,20 @@ static void ieee802_1x_participant_timer(void *eloop_ctx, void *timeout_ctx)
 
 	if (lp_changed) {
 		if (dl_list_empty(&participant->live_peers)) {
+			/*
+			 * Try a hitless handoff before tearing anything down:
+			 * if a standby participant still has a live peer, give
+			 * it the active SAK and SecY ownership so the installed
+			 * SAs keep protecting traffic while it rekeys. Must run
+			 * before the SAK-use flags below are cleared, since the
+			 * handoff copies them to the standby.
+			 */
+			promoted = NULL;
+			if (participant->secy_installed)
+				promoted =
+					ieee802_1x_kay_transfer_secy_to_standby(
+						kay, participant);
+
 			participant->advised_desired = false;
 			participant->advised_capability =
 				MACSEC_CAP_NOT_IMPLEMENTED;
@@ -3111,7 +3241,14 @@ static void ieee802_1x_participant_timer(void *eloop_ctx, void *timeout_ctx)
 			participant->orx = false;
 			participant->is_key_server = false;
 			participant->is_elected = false;
-			if (participant->secy_installed) {
+			if (promoted) {
+				/*
+				 * Hitless failover: the active SAK stays
+				 * programmed in the SecY and the promoted
+				 * standby performs a make-before-break rekey.
+				 */
+				enforce_single_principal(kay);
+			} else if (participant->secy_installed) {
 				kay->authenticated = false;
 				kay->secured = false;
 				kay->failed = false;
@@ -4394,11 +4531,9 @@ void
 ieee802_1x_kay_delete_mka(struct ieee802_1x_kay *kay, struct mka_key_name *ckn)
 {
 	struct ieee802_1x_mka_participant *participant;
-	struct ieee802_1x_mka_participant *standby;
 	struct ieee802_1x_kay_peer *peer;
 	struct data_key *sak;
 	struct receive_sc *rxsc;
-	bool transfer_secy = false;
 
 	if (!kay || !ckn)
 		return;
@@ -4426,23 +4561,12 @@ ieee802_1x_kay_delete_mka(struct ieee802_1x_kay *kay, struct mka_key_name *ckn)
 			   "KaY: Deleting old participant before MKA Life Time elapsed since last SAK distribution (§9.3.2)");
 	}
 
-	if (participant->secy_installed) {
-		dl_list_for_each(standby, &kay->participant_list,
-				 struct ieee802_1x_mka_participant, list) {
-			if (!dl_list_empty(&standby->live_peers)) {
-				wpa_printf(MSG_DEBUG,
-					   "KaY: Transferring SecY ownership to standby participant");
-				standby->secy_installed = true;
-				standby->principal = true;
-				standby->new_sak = true;
-				transfer_secy = true;
-				break;
-			}
-		}
-		if (transfer_secy)
-			participant->secy_installed = false;
-	}
-	if (transfer_secy)
+	/* Hand the active SAK and SecY ownership to a live standby before
+	 * freeing this participant, so an explicit removal (e.g. the operator
+	 * retiring the primary CAK) is also a hitless make-before-break
+	 * handoff rather than a datapath teardown. */
+	if (participant->secy_installed &&
+	    ieee802_1x_kay_transfer_secy_to_standby(kay, participant))
 		enforce_single_principal(kay);
 
 	/* remove live peer */
