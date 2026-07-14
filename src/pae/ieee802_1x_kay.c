@@ -2900,7 +2900,21 @@ static void enforce_single_principal(struct ieee802_1x_kay *kay)
 				   "KaY: Revoking SecY from non-principal participant");
 		p->secy_installed = false;
 		p->principal = false;
-		p->is_key_server = false;
+		/*
+		 * Do NOT clear is_key_server here. Key Server election is a
+		 * per-CA decision owned by ieee802_1x_kay_elect_key_server()
+		 * based on actor priority/SCI, and must be identical for every
+		 * participant between the same two devices. Overriding it here
+		 * made a non-principal (standby) participant advertise
+		 * Key Server = 0, letting a lower-priority peer win the election
+		 * for that CA and causing the key server to change on failover.
+		 * The single-principal invariant is enforced by secy_installed
+		 * alone: SAK generation (new_sak && is_key_server &&
+		 * secy_installed), decide_macsec_use(), and all CP signalling are
+		 * already gated on secy_installed, so a standby that remains a
+		 * Key Server does not install SAs or distribute a SAK until it is
+		 * promoted to principal.
+		 */
 	}
 }
 
