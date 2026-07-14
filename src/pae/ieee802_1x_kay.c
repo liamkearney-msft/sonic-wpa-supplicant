@@ -644,11 +644,21 @@ ieee802_1x_kay_deinit_receive_sc(
 	}
 
 	dl_list_for_each_safe(psa, pre_sa, &psc->sa_list, struct receive_sa,
-			      list)
-		ieee802_1x_delete_receive_sa(participant->kay, psa);
+			      list) {
+		if (participant->secy_installed)
+			ieee802_1x_delete_receive_sa(participant->kay, psa);
+		else
+			/*
+			 * Demoted participant: keep the shared SAK's receive SA
+			 * programmed in the SecY for the new principal; drop
+			 * only the KaY bookkeeping.
+			 */
+			ieee802_1x_kay_deinit_receive_sa(psa);
+	}
 
 	dl_list_del(&psc->list);
-	secy_delete_receive_sc(participant->kay, psc);
+	if (participant->secy_installed)
+		secy_delete_receive_sc(participant->kay, psc);
 	os_free(psc);
 }
 
@@ -2583,6 +2593,48 @@ static int compare_priorities(const struct ieee802_1x_kay_peer *peer,
 
 
 /**
+ * ieee802_1x_kay_has_other_participant - Is there another participant (a
+ * primary/fallback sibling) on this KaY besides the given one?
+ *
+ * All participants on a KaY share the actor SCI, so the presence of a sibling
+ * means the local device is running the primary + fallback CAK model.
+ */
+static bool
+ieee802_1x_kay_has_other_participant(struct ieee802_1x_kay *kay,
+				     struct ieee802_1x_mka_participant *self)
+{
+	struct ieee802_1x_mka_participant *p;
+
+	dl_list_for_each(p, &kay->participant_list,
+			 struct ieee802_1x_mka_participant, list) {
+		if (p != self)
+			return true;
+	}
+
+	return false;
+}
+
+
+/**
+ * ieee802_1x_kay_participant_has_installed_sak - Does this participant already
+ * hold a SAK that has been programmed into the SecY?
+ */
+static bool
+ieee802_1x_kay_participant_has_installed_sak(
+	struct ieee802_1x_mka_participant *participant)
+{
+	struct data_key *sak;
+
+	dl_list_for_each(sak, &participant->sak_list, struct data_key, list) {
+		if (sak->installed)
+			return true;
+	}
+
+	return false;
+}
+
+
+/**
  * ieee802_1x_kay_elect_key_server - elect the key server
  * when to elect: whenever the live peers list changes
  */
@@ -2647,7 +2699,16 @@ ieee802_1x_kay_elect_key_server(struct ieee802_1x_mka_participant *participant)
 
 		participant->is_key_server = true;
 		participant->principal = true;
-		participant->new_sak = true;
+		/*
+		 * Only generate a fresh SAK if we do not already hold one that
+		 * is programmed into the SecY. When a fallback participant is
+		 * promoted on failover it inherits the active shared SAK; forcing
+		 * a rekey there is unnecessary and, mid-failover, does not settle
+		 * cleanly. A deliberate rekey still happens via the normal
+		 * triggers (new-SAK signal, PN exhaustion).
+		 */
+		if (!ieee802_1x_kay_participant_has_installed_sak(participant))
+			participant->new_sak = true;
 		wpa_printf(MSG_DEBUG, "KaY: I am elected as key server");
 		participant->to_dist_sak = false;
 		participant->is_elected = true;
@@ -3059,10 +3120,18 @@ ieee802_1x_kay_transfer_secy_to_standby(
 	standby->advised_capability = leaving->advised_capability;
 	standby->to_dist_sak = false;
 
-	/* Transfer SecY ownership and trigger a make-before-break rekey. */
+	/*
+	 * Transfer SecY ownership but keep using the existing shared SAK - do
+	 * NOT force a rekey here. Both ends already hold this SAK, so traffic
+	 * keeps flowing on it while the failed CA's MKA session tears down
+	 * naturally (its MKPDUs stop authenticating and the peer expires over
+	 * MKA Life Time). Forcing an immediate rekey during that churn does not
+	 * converge; a fresh SAK is rolled later as an ordinary make-before-break
+	 * rekey once the surviving CA is stable. This matches Arista EOS, which
+	 * keeps the single shared SAK in use across the failover.
+	 */
 	standby->secy_installed = true;
 	standby->principal = true;
-	standby->new_sak = true;
 	leaving->secy_installed = false;
 
 	return standby;
@@ -3241,8 +3310,18 @@ static void ieee802_1x_participant_timer(void *eloop_ctx, void *timeout_ctx)
 	 * the key server to its peer list.
 	 * So we need to update mi to avoid the failure of the re-establishment
 	 * MKA session.
+	 *
+	 * Exception: do NOT reset the MI when another participant (a
+	 * primary/fallback sibling) exists on this KaY. All participants share
+	 * the actor SCI, so changing this participant's MI makes the peer treat
+	 * us as a "new MI, same SCI" duplicate on the sibling CA, ignore our
+	 * MKPDUs until the old MI ages out, and expire the peer - which churns
+	 * the surviving fallback CA and breaks the hitless failover. The
+	 * sibling CA already provides continuity, so the re-establishment
+	 * benefit of the reset does not apply here.
 	 */
-	if (key_server_removed) {
+	if (key_server_removed &&
+	    !ieee802_1x_kay_has_other_participant(kay, participant)) {
 		if (!reset_participant_mi(participant)) {
 			wpa_printf(MSG_WARNING, "KaY: Could not update mi");
 		} else {
@@ -3447,8 +3526,20 @@ ieee802_1x_kay_deinit_transmit_sc(
 	struct transmit_sa *psa, *tmp;
 
 	wpa_printf(MSG_DEBUG, "KaY: Delete transmit SC");
-	dl_list_for_each_safe(psa, tmp, &psc->sa_list, struct transmit_sa, list)
-		ieee802_1x_delete_transmit_sa(participant->kay, psa);
+	dl_list_for_each_safe(psa, tmp, &psc->sa_list, struct transmit_sa,
+			      list) {
+		if (participant->secy_installed) {
+			ieee802_1x_delete_transmit_sa(participant->kay, psa);
+		} else {
+			/*
+			 * A demoted participant (SecY ownership handed to a
+			 * standby) must not remove the shared SAK's transmit SA
+			 * from the SecY - the new principal is still using it.
+			 * Drop only the KaY bookkeeping.
+			 */
+			ieee802_1x_kay_deinit_transmit_sa(psa);
+		}
+	}
 
 	if (participant->secy_installed)
 		secy_delete_transmit_sc(participant->kay, psc);
@@ -4067,11 +4158,27 @@ static int ieee802_1x_kay_decode_mkpdu(struct ieee802_1x_kay *kay,
 				return -1;
 			}
 
-			/* Live peer is probably hung if it hasn't sent SAK-USE
-			 * after a reasonable number of MKPDUs. Drop the MKPDU,
-			 * which will eventually force an timeout. */
-			if (++peer->missing_sak_use_count >
-			    MAX_MISSING_SAK_USE) {
+			if (!participant->to_use_sak) {
+				/*
+				 * This participant has no SAK in use on this CA
+				 * - e.g. a live standby (fallback) participant
+				 * that the key server has not distributed a SAK
+				 * to. The peer has nothing to acknowledge with a
+				 * SAK-USE parameter set, so treat the MKPDU as
+				 * ordinary liveness and refresh the watchdog.
+				 * Otherwise the fallback peer keeps timing out
+				 * and re-establishing every few seconds, and that
+				 * churn tears the fallback CA down at the exact
+				 * moment it must carry a hitless failover.
+				 */
+				peer->missing_sak_use_count = 0;
+				peer->expire = time(NULL) + MKA_LIFE_TIME / 1000;
+			} else if (++peer->missing_sak_use_count >
+				   MAX_MISSING_SAK_USE) {
+				/* Live peer is probably hung if it hasn't sent
+				 * SAK-USE after a reasonable number of MKPDUs.
+				 * Drop the MKPDU, which will eventually force an
+				 * timeout. */
 				wpa_printf(MSG_INFO,
 					   "KaY: Discarding Rx MKPDU: Live Peer not sending SAK-USE");
 				return -1;
