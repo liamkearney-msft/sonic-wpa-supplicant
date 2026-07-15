@@ -3347,18 +3347,8 @@ static void ieee802_1x_participant_timer(void *eloop_ctx, void *timeout_ctx)
 	 * the key server to its peer list.
 	 * So we need to update mi to avoid the failure of the re-establishment
 	 * MKA session.
-	 *
-	 * Exception: do NOT reset the MI when another participant (a
-	 * primary/fallback sibling) exists on this KaY. All participants share
-	 * the actor SCI, so changing this participant's MI makes the peer treat
-	 * us as a "new MI, same SCI" duplicate on the sibling CA, ignore our
-	 * MKPDUs until the old MI ages out, and expire the peer - which churns
-	 * the surviving fallback CA and breaks the hitless failover. The
-	 * sibling CA already provides continuity, so the re-establishment
-	 * benefit of the reset does not apply here.
 	 */
-	if (key_server_removed &&
-	    !ieee802_1x_kay_has_other_participant(kay, participant)) {
+	if (key_server_removed) {
 		if (!reset_participant_mi(participant)) {
 			wpa_printf(MSG_WARNING, "KaY: Could not update mi");
 		} else {
