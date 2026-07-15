@@ -402,6 +402,42 @@ fail:
 }
 
 
+/*
+ * Create the optional backup (fallback) MKA participant from the second
+ * pre-shared key (mka_cak2/mka_ckn2), used for hitless CAK rollover. This is
+ * best-effort: a failure to create it leaves the primary participant running.
+ */
+static void
+ieee802_1x_create_preshared_mka_fallback(struct wpa_supplicant *wpa_s,
+					 struct wpa_ssid *ssid)
+{
+	struct mka_key *cak2;
+	struct mka_key_name *ckn2;
+
+	if ((ssid->mka_psk_set2 & MKA_PSK_SET) != MKA_PSK_SET)
+		return;
+
+	ckn2 = os_zalloc(sizeof(*ckn2));
+	cak2 = os_zalloc(sizeof(*cak2));
+	if (ckn2 && cak2) {
+		cak2->len = ssid->mka_cak2_len;
+		os_memcpy(cak2->key, ssid->mka_cak2, cak2->len);
+		ckn2->len = ssid->mka_ckn2_len;
+		os_memcpy(ckn2->name, ssid->mka_ckn2, ckn2->len);
+
+		if (!ieee802_1x_kay_create_mka(wpa_s->kay, ckn2, cak2, 0, PSK,
+					       false))
+			wpa_printf(MSG_WARNING,
+				   "KaY: Failed to create backup MKA participant");
+		else
+			wpa_printf(MSG_DEBUG,
+				   "KaY: Backup MKA participant created");
+	}
+	os_free(cak2);
+	os_free(ckn2);
+}
+
+
 void * ieee802_1x_create_preshared_mka(struct wpa_supplicant *wpa_s,
 				       struct wpa_ssid *ssid)
 {
@@ -433,35 +469,12 @@ void * ieee802_1x_create_preshared_mka(struct wpa_supplicant *wpa_s,
 	os_memcpy(ckn->name, ssid->mka_ckn, ckn->len);
 
 	res = ieee802_1x_kay_create_mka(wpa_s->kay, ckn, cak, 0, PSK, false);
-	if (!res)
-		goto dealloc;
-
-	if ((ssid->mka_psk_set2 & MKA_PSK_SET) == MKA_PSK_SET) {
-		struct mka_key *cak2;
-		struct mka_key_name *ckn2;
-
-		ckn2 = os_zalloc(sizeof(*ckn2));
-		cak2 = os_zalloc(sizeof(*cak2));
-		if (ckn2 && cak2) {
-			cak2->len = ssid->mka_cak2_len;
-			os_memcpy(cak2->key, ssid->mka_cak2, cak2->len);
-			ckn2->len = ssid->mka_ckn2_len;
-			os_memcpy(ckn2->name, ssid->mka_ckn2, ckn2->len);
-
-			if (!ieee802_1x_kay_create_mka(wpa_s->kay, ckn2, cak2, 0,
-						       PSK, false)) {
-				wpa_printf(MSG_WARNING,
-					   "KaY: Failed to create backup MKA participant");
-			} else {
-				wpa_printf(MSG_DEBUG,
-					   "KaY: Backup MKA participant created");
-			}
-		}
-		os_free(cak2);
-		os_free(ckn2);
+	if (res) {
+		/* Optionally create the backup (fallback) participant for
+		 * hitless CAK rollover, if a second PSK is configured. */
+		ieee802_1x_create_preshared_mka_fallback(wpa_s, ssid);
+		goto free_cak;
 	}
-
-	goto free_cak;
 
 dealloc:
 	/* Failed to create MKA */
