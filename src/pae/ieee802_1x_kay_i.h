@@ -103,6 +103,10 @@ struct ieee802_1x_mka_participant {
 
 	/* used for active participant */
 	bool principal;
+	/* Lower-priority standby CA: only owns the controlled port when the
+	 * primary CA has no live peer. The primary (non-fallback) CA is
+	 * preferred and reclaims ownership as soon as it is live again. */
+	bool is_fallback;
 	struct dl_list live_peers;
 	struct dl_list potential_peers;
 

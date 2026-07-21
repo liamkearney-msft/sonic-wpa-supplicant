@@ -237,6 +237,14 @@ struct ieee802_1x_kay {
 	struct dl_list participant_list;
 	enum macsec_policy policy;
 
+	/* The principal participant is the MKA that currently owns the CP state
+	 * machine and the SecY (data path) programming. All CP -> KaY
+	 * operations act on this participant. It is tracked as an explicit
+	 * pointer (rather than scanning participant_list for the "principal"
+	 * flag) so that the CP owner can be looked up cheaply and switched
+	 * atomically when a fallback CKN takes over (SONiC fallback-CAK). */
+	struct ieee802_1x_mka_participant *principal_participant;
+
 	struct ieee802_1x_cp_sm *cp;
 
 	struct l2_packet_data *l2_mka;
@@ -263,6 +271,8 @@ ieee802_1x_kay_create_mka(struct ieee802_1x_kay *kay,
 			  const struct mka_key *cak,
 			  u32 life, enum mka_created_mode mode,
 			  bool is_authenticator);
+void ieee802_1x_kay_set_participant_fallback(
+	struct ieee802_1x_mka_participant *participant, bool is_fallback);
 void ieee802_1x_kay_delete_mka(struct ieee802_1x_kay *kay,
 			       struct mka_key_name *ckn);
 void ieee802_1x_kay_mka_participate(struct ieee802_1x_kay *kay,

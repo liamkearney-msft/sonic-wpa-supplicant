@@ -433,8 +433,43 @@ void * ieee802_1x_create_preshared_mka(struct wpa_supplicant *wpa_s,
 	os_memcpy(ckn->name, ssid->mka_ckn, ckn->len);
 
 	res = ieee802_1x_kay_create_mka(wpa_s->kay, ckn, cak, 0, PSK, false);
-	if (res)
-		goto free_cak;
+	if (!res)
+		goto dealloc;
+
+	/* Optionally bring up a standby MKA participant for the fallback CKN.
+	 * It shares the same KaY/SecY as the primary and only takes over the
+	 * controlled port if the primary CA fails (see the KaY failover path).
+	 */
+	if ((ssid->mka_psk_set_fallback & MKA_PSK_SET_FALLBACK) ==
+	    MKA_PSK_SET_FALLBACK) {
+		struct mka_key *cak_fb;
+		struct mka_key_name *ckn_fb;
+
+		ckn_fb = os_zalloc(sizeof(*ckn_fb));
+		cak_fb = os_zalloc(sizeof(*cak_fb));
+		if (ckn_fb && cak_fb) {
+			struct ieee802_1x_mka_participant *fb;
+
+			cak_fb->len = ssid->mka_cak_fallback_len;
+			os_memcpy(cak_fb->key, ssid->mka_cak_fallback,
+				  cak_fb->len);
+			ckn_fb->len = ssid->mka_ckn_fallback_len;
+			os_memcpy(ckn_fb->name, ssid->mka_ckn_fallback,
+				  ckn_fb->len);
+			fb = ieee802_1x_kay_create_mka(wpa_s->kay, ckn_fb,
+						       cak_fb, 0, PSK, false);
+			if (!fb)
+				wpa_printf(MSG_WARNING,
+					   "MACsec: Failed to create fallback MKA participant");
+			else
+				ieee802_1x_kay_set_participant_fallback(fb,
+								       true);
+		}
+		os_free(cak_fb);
+		os_free(ckn_fb);
+	}
+
+	goto free_cak;
 
 dealloc:
 	/* Failed to create MKA */
