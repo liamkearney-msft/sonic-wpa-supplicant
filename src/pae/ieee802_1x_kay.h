@@ -119,6 +119,13 @@ struct receive_sc {
 
 	u32 ssci; /* SSCI - XPN cipher suites only */
 
+	/* Number of MKA participants (CAs) that currently reference this
+	 * hardware receive SC via a live peer with this SCI. The receive SC
+	 * lives on the KaY (one SecY per port); a fallback CA shares the same
+	 * SC as the primary CA over the same physical link, so it is created
+	 * once (refcnt 1) and freed only when the last CA drops its peer. */
+	int refcnt;
+
 	struct dl_list list;
 	struct dl_list sa_list;
 };
@@ -248,6 +255,14 @@ struct ieee802_1x_kay {
 	 * flag) so that the CP owner can be looked up cheaply and switched
 	 * atomically when a fallback CKN takes over (SONiC fallback-CAK). */
 	struct ieee802_1x_mka_participant *principal_participant;
+
+	/* The transmit SC and the receive SCs model the single SecY (one per
+	 * port), so they live on the KaY and are shared by every MKA
+	 * participant. The transmit SC always uses the actor SCI; each receive
+	 * SC is keyed by a peer SCI and reference-counted across the CAs that
+	 * see that peer (see struct receive_sc::refcnt). */
+	struct transmit_sc *txsc;
+	struct dl_list rxsc_list;
 
 	struct ieee802_1x_cp_sm *cp;
 

@@ -645,17 +645,17 @@ static void ieee802_1x_delete_receive_sa(struct ieee802_1x_kay *kay,
  **/
 static void
 ieee802_1x_kay_deinit_receive_sc(
-	struct ieee802_1x_mka_participant *participant, struct receive_sc *psc)
+	struct ieee802_1x_kay *kay, struct receive_sc *psc)
 {
 	struct receive_sa *psa, *pre_sa;
 
 	wpa_printf(MSG_DEBUG, "KaY: Delete receive SC");
 	dl_list_for_each_safe(psa, pre_sa, &psc->sa_list, struct receive_sa,
 			      list)
-		ieee802_1x_delete_receive_sa(participant->kay, psa);
+		ieee802_1x_delete_receive_sa(kay, psa);
 
 	dl_list_del(&psc->list);
-	secy_delete_receive_sc(participant->kay, psc);
+	secy_delete_receive_sc(kay, psc);
 	os_free(psc);
 }
 
@@ -664,6 +664,94 @@ static void ieee802_1x_kay_dump_peer(struct ieee802_1x_kay_peer *peer)
 {
 	wpa_printf(MSG_DEBUG, "\tMI: %s  MN: %d  SCI: %s",
 		   mi_txt(peer->mi), peer->mn, sci_txt(&peer->sci));
+}
+
+
+/**
+ * ieee802_1x_kay_find_receive_sc - Find a receive SC by SCI on the KaY
+ */
+static struct receive_sc *
+ieee802_1x_kay_find_receive_sc(struct ieee802_1x_kay *kay,
+			       const struct ieee802_1x_mka_sci *sci)
+{
+	struct receive_sc *rxsc;
+
+	dl_list_for_each(rxsc, &kay->rxsc_list, struct receive_sc, list) {
+		if (sci_equal(&rxsc->sci, sci))
+			return rxsc;
+	}
+
+	return NULL;
+}
+
+
+/**
+ * ieee802_1x_kay_ref_receive_sc - Reference (find-or-create) a receive SC
+ *
+ * The receive SC is SecY/hardware state shared by all CAs on the port. The
+ * first CA to see a given peer SCI creates the hardware SC; a fallback CA over
+ * the same link just bumps the reference count and reuses it. Returns the SC
+ * (list-sorted by SCI) or NULL on failure.
+ */
+static struct receive_sc *
+ieee802_1x_kay_ref_receive_sc(struct ieee802_1x_kay *kay,
+			      const struct ieee802_1x_mka_sci *sci)
+{
+	struct receive_sc *rxsc, *new_rxsc;
+	bool found = false;
+
+	rxsc = ieee802_1x_kay_find_receive_sc(kay, sci);
+	if (rxsc) {
+		rxsc->refcnt++;
+		return rxsc;
+	}
+
+	new_rxsc = ieee802_1x_kay_init_receive_sc(sci);
+	if (!new_rxsc)
+		return NULL;
+
+	if (secy_create_receive_sc(kay, new_rxsc)) {
+		os_free(new_rxsc);
+		return NULL;
+	}
+	new_rxsc->refcnt = 1;
+
+	/* Keep rxsc_list sorted by SCI */
+	dl_list_for_each(rxsc, &kay->rxsc_list, struct receive_sc, list) {
+		if (os_memcmp(&new_rxsc->sci, &rxsc->sci,
+			      sizeof(struct ieee802_1x_mka_sci)) > 0) {
+			dl_list_add(&rxsc->list, &new_rxsc->list);
+			found = true;
+			break;
+		}
+	}
+	if (!found)
+		dl_list_add(&kay->rxsc_list, &new_rxsc->list);
+
+	return new_rxsc;
+}
+
+
+/**
+ * ieee802_1x_kay_deref_receive_sc - Drop a reference to a receive SC
+ *
+ * Frees the hardware receive SC (and its SAs) only when the last CA that
+ * referenced the peer SCI drops it.
+ */
+static void
+ieee802_1x_kay_deref_receive_sc(struct ieee802_1x_kay *kay,
+				const struct ieee802_1x_mka_sci *sci)
+{
+	struct receive_sc *rxsc;
+
+	rxsc = ieee802_1x_kay_find_receive_sc(kay, sci);
+	if (!rxsc)
+		return;
+
+	if (--rxsc->refcnt > 0)
+		return;
+
+	ieee802_1x_kay_deinit_receive_sc(kay, rxsc);
 }
 
 
@@ -696,9 +784,6 @@ ieee802_1x_kay_create_live_peer(struct ieee802_1x_mka_participant *participant,
 				const u8 *mi, u32 mn)
 {
 	struct ieee802_1x_kay_peer *peer;
-	struct receive_sc *rxsc;
-	struct receive_sc *new_rxsc;
-	bool found = false;
 
 	peer = ieee802_1x_kay_create_peer(mi, mn);
 	if (!peer)
@@ -707,31 +792,11 @@ ieee802_1x_kay_create_live_peer(struct ieee802_1x_mka_participant *participant,
 	os_memcpy(&peer->sci, &participant->current_peer_sci,
 		  sizeof(peer->sci));
 
-	new_rxsc = ieee802_1x_kay_init_receive_sc(&peer->sci);
-	if (!new_rxsc) {
-		os_free(peer);
-		return NULL;
-	}
-
-	if (secy_create_receive_sc(participant->kay, new_rxsc)) {
-		os_free(new_rxsc);
+	if (!ieee802_1x_kay_ref_receive_sc(participant->kay, &peer->sci)) {
 		os_free(peer);
 		return NULL;
 	}
 	dl_list_add(&participant->live_peers, &peer->list);
-	/* Keep rxsc_list sorted by SCI */
-	dl_list_for_each(rxsc, &participant->rxsc_list, struct receive_sc,
-			 list) {
-		if (os_memcmp(&new_rxsc->sci, &rxsc->sci,
-			      sizeof(struct ieee802_1x_mka_sci)) > 0) {
-			dl_list_add(&rxsc->list, &new_rxsc->list);
-			found = true;
-			break;
-		}
-	}
-	if (!found) {
-		dl_list_add(&participant->rxsc_list, &new_rxsc->list);
-	}
 
 	wpa_printf(MSG_DEBUG, "KaY: Live peer created");
 	ieee802_1x_kay_dump_peer(peer);
@@ -770,16 +835,9 @@ ieee802_1x_kay_move_live_peer(struct ieee802_1x_mka_participant *participant,
 			      u8 *mi, u32 mn)
 {
 	struct ieee802_1x_kay_peer *peer;
-	struct receive_sc *rxsc;
-	struct receive_sc *new_rxsc;
-	bool found = false;
 
 	peer = ieee802_1x_kay_get_potential_peer(participant, mi);
 	if (!peer)
-		return NULL;
-
-	new_rxsc = ieee802_1x_kay_init_receive_sc(&participant->current_peer_sci);
-	if (!new_rxsc)
 		return NULL;
 
 	os_memcpy(&peer->sci, &participant->current_peer_sci,
@@ -790,28 +848,14 @@ ieee802_1x_kay_move_live_peer(struct ieee802_1x_mka_participant *participant,
 	wpa_printf(MSG_DEBUG, "KaY: Move potential peer to live peer");
 	ieee802_1x_kay_dump_peer(peer);
 
-	dl_list_del(&peer->list);
-	if (secy_create_receive_sc(participant->kay, new_rxsc)) {
+	if (!ieee802_1x_kay_ref_receive_sc(participant->kay, &peer->sci)) {
 		wpa_printf(MSG_ERROR, "KaY: Can't create SC, discard peer");
-		os_free(new_rxsc);
+		dl_list_del(&peer->list);
 		os_free(peer);
 		return NULL;
 	}
+	dl_list_del(&peer->list);
 	dl_list_add_tail(&participant->live_peers, &peer->list);
-
-	/* Keep rxsc_list sorted by SCI */
-	dl_list_for_each(rxsc, &participant->rxsc_list, struct receive_sc,
-			 list) {
-		if (os_memcmp(&new_rxsc->sci, &rxsc->sci,
-			      sizeof(struct ieee802_1x_mka_sci)) > 0) {
-			dl_list_add(&rxsc->list, &new_rxsc->list);
-			found = true;
-			break;
-		}
-	}
-	if (!found) {
-		dl_list_add(&participant->rxsc_list, &new_rxsc->list);
-	}
 
 	return peer;
 }
@@ -1374,7 +1418,7 @@ ieee802_1x_mka_get_lpn(struct ieee802_1x_mka_participant *principal,
 	struct transmit_sa *txsa;
 	u64 lpn = 0;
 
-	dl_list_for_each(txsa, &principal->txsc->sa_list,
+	dl_list_for_each(txsa, &principal->kay->txsc->sa_list,
 			 struct transmit_sa, list) {
 		if (is_ki_equal(&txsa->pkey->key_identifier, ki)) {
 			/* Per IEEE Std 802.1X-2010, Clause 9, "Each SecY uses
@@ -1635,7 +1679,7 @@ ieee802_1x_mka_decode_sak_use_body(
 		struct receive_sa *rxsa;
 		bool found = false;
 		u64 high_bits = 0, low_bits = 0;
-		dl_list_for_each(rxsc, &participant->rxsc_list,
+		dl_list_for_each(rxsc, &participant->kay->rxsc_list,
 				 struct receive_sc, list) {
 			dl_list_for_each(rxsa, &rxsc->sa_list,
 					 struct receive_sa, list) {
@@ -1716,7 +1760,7 @@ ieee802_1x_mka_decode_sak_use_body(
 		struct receive_sa *rxsa;
 		bool found = false;
 
-		dl_list_for_each(rxsc, &participant->rxsc_list,
+		dl_list_for_each(rxsc, &participant->kay->rxsc_list,
 				 struct receive_sc, list) {
 			dl_list_for_each(rxsa, &rxsc->sa_list,
 					 struct receive_sa, list) {
@@ -2859,40 +2903,20 @@ static void ieee802_1x_delete_transmit_sa(struct ieee802_1x_kay *kay,
 
 
 /**
- * ieee802_1x_kay_find_receive_sc - Find a receive SC by SCI in a participant
- */
-static struct receive_sc *
-ieee802_1x_kay_find_receive_sc(struct ieee802_1x_mka_participant *participant,
-			       const struct ieee802_1x_mka_sci *sci)
-{
-	struct receive_sc *rxsc;
-
-	dl_list_for_each(rxsc, &participant->rxsc_list, struct receive_sc,
-			 list) {
-		if (sci_equal(&rxsc->sci, sci))
-			return rxsc;
-	}
-
-	return NULL;
-}
-
-
-/**
- * ieee802_1x_kay_migrate_principal_sas - Re-home the installed SAK/SAs on swap
+ * ieee802_1x_kay_migrate_principal_sas - Re-home installed-SAK bookkeeping
  *
- * The active SAK and its SAs model a single SecY (hardware) state that is
- * shared by every MKA participant on the port; the SAK Use advertised by each
- * MKA is just a report of that one installed key. When CP ownership moves to a
- * fallback CKN, that SecY state must follow the principal pointer so that the
- * SA helpers (which resolve the current principal) keep seeing the installed
- * key and so that a later CP RETIRE frees the old SAs correctly under the new
- * principal.
+ * The transmit SC and receive SCs (and therefore their SAs) live on the KaY
+ * and are shared by every participant, so they never move on a principal swap.
+ * What is still per-participant is the SAK list: each CA holds the data_key(s)
+ * it received/generated under its own CKN, and the installed SAs reference one
+ * of them (the principal's). When CP ownership moves to a fallback CKN, that
+ * installed data_key must follow the principal pointer so that a later CP
+ * RETIRE (ieee802_1x_kay_delete_sak(), which searches the principal's sak_list)
+ * can free it, and so the distribution state carries over until the next rekey.
  *
  * This is pure bookkeeping: the datapath is left untouched (no secy_* calls),
  * which is what allows the switch-over without reprogramming the CP or the
- * hardware. The hardware receive SC is keyed by SCI and the new principal
- * already owns a receive SC for each peer SCI, so an emptied receive SC left on
- * the old participant is freed here *without* deleting the shared hardware SC.
+ * hardware.
  */
 static void
 ieee802_1x_kay_migrate_principal_sas(
@@ -2900,61 +2924,24 @@ ieee802_1x_kay_migrate_principal_sas(
 	struct ieee802_1x_mka_participant *new_principal)
 {
 	struct data_key *sak, *pre_sak;
-	struct transmit_sa *txsa, *pre_txsa;
-	struct receive_sc *rxsc, *pre_rxsc;
-	struct receive_sa *rxsa, *pre_rxsa;
 
 	if (!old || !new_principal || old == new_principal)
 		return;
 
 	wpa_printf(MSG_DEBUG,
-		   "KaY: Re-homing installed SAK/SA bookkeeping to new principal");
+		   "KaY: Re-homing installed SAK bookkeeping to new principal");
 
-	/* Move the SAK(s). */
+	/* Move the installed SAK(s); the shared SAs already reference them. */
 	dl_list_for_each_safe(sak, pre_sak, &old->sak_list, struct data_key,
 			      list) {
 		dl_list_del(&sak->list);
 		dl_list_add_tail(&new_principal->sak_list, &sak->list);
 	}
 
-	/* Move the transmit SAs; both txsc use the actor SCI. */
-	dl_list_for_each_safe(txsa, pre_txsa, &old->txsc->sa_list,
-			      struct transmit_sa, list) {
-		dl_list_del(&txsa->list);
-		txsa->sc = new_principal->txsc;
-		dl_list_add_tail(&new_principal->txsc->sa_list, &txsa->list);
-	}
-
-	/* Move the receive SAs into the new principal's matching-SCI SC. */
-	dl_list_for_each_safe(rxsc, pre_rxsc, &old->rxsc_list,
-			      struct receive_sc, list) {
-		struct receive_sc *dst =
-			ieee802_1x_kay_find_receive_sc(new_principal,
-						       &rxsc->sci);
-
-		if (dst) {
-			dl_list_for_each_safe(rxsa, pre_rxsa, &rxsc->sa_list,
-					      struct receive_sa, list) {
-				dl_list_del(&rxsa->list);
-				rxsa->sc = dst;
-				dl_list_add_tail(&dst->sa_list, &rxsa->list);
-			}
-			/* Hardware SC kept alive by the new principal's SC for
-			 * the same SCI; free this empty struct only. */
-			dl_list_del(&rxsc->list);
-			os_free(rxsc);
-		} else {
-			/* No SC for this SCI yet - hand the whole SC over. */
-			dl_list_del(&rxsc->list);
-			dl_list_add_tail(&new_principal->rxsc_list,
-					 &rxsc->list);
-		}
-	}
-
 	/* Carry over the distribution state so the new principal keeps driving
-	 * the installed SAK until the next rekey. The latest/old key identity
-	 * (lki/oki/AN/tx/rx) is SecY state held on the KaY, so it needs no
-	 * migration. */
+	 * the installed SAK until the next rekey. The transmit/receive SCs and
+	 * the latest/old key identity (lki/oki/AN/tx/rx) are SecY state held on
+	 * the KaY, so they need no migration. */
 	new_principal->to_use_sak = old->to_use_sak;
 	new_principal->new_key = old->new_key;
 
@@ -3052,9 +3039,9 @@ ieee802_1x_kay_reconcile_principal(struct ieee802_1x_kay *kay)
 		kay->oan = 0;
 		kay->otx = false;
 		kay->orx = false;
-		if (cur) {
+		if (kay->txsc) {
 			dl_list_for_each_safe(txsa, pre_txsa,
-					      &cur->txsc->sa_list,
+					      &kay->txsc->sa_list,
 					      struct transmit_sa, list)
 				ieee802_1x_delete_transmit_sa(kay, txsa);
 		}
@@ -3096,7 +3083,6 @@ static void ieee802_1x_participant_timer(void *eloop_ctx, void *timeout_ctx)
 	time_t now = time(NULL);
 	bool lp_changed;
 	bool key_server_removed;
-	struct receive_sc *rxsc, *pre_rxsc;
 
 	participant = (struct ieee802_1x_mka_participant *)eloop_ctx;
 	kay = participant->kay;
@@ -3127,14 +3113,7 @@ static void ieee802_1x_participant_timer(void *eloop_ctx, void *timeout_ctx)
 			wpa_hexdump(MSG_DEBUG, "\tMI: ", peer->mi,
 				    sizeof(peer->mi));
 			wpa_printf(MSG_DEBUG, "\tMN: %d", peer->mn);
-			dl_list_for_each_safe(rxsc, pre_rxsc,
-					      &participant->rxsc_list,
-					      struct receive_sc, list) {
-				if (sci_equal(&rxsc->sci, &peer->sci)) {
-					ieee802_1x_kay_deinit_receive_sc(
-						participant, rxsc);
-				}
-			}
+			ieee802_1x_kay_deref_receive_sc(kay, &peer->sci);
 			key_server_removed |= peer->is_key_server;
 			dl_list_del(&peer->list);
 			os_free(peer);
@@ -3318,15 +3297,15 @@ ieee802_1x_kay_init_transmit_sc(const struct ieee802_1x_mka_sci *sci)
  */
 static void
 ieee802_1x_kay_deinit_transmit_sc(
-	struct ieee802_1x_mka_participant *participant, struct transmit_sc *psc)
+	struct ieee802_1x_kay *kay, struct transmit_sc *psc)
 {
 	struct transmit_sa *psa, *tmp;
 
 	wpa_printf(MSG_DEBUG, "KaY: Delete transmit SC");
 	dl_list_for_each_safe(psa, tmp, &psc->sa_list, struct transmit_sa, list)
-		ieee802_1x_delete_transmit_sa(participant->kay, psa);
+		ieee802_1x_delete_transmit_sa(kay, psa);
 
-	secy_delete_transmit_sc(participant->kay, psc);
+	secy_delete_transmit_sc(kay, psc);
 	os_free(psc);
 }
 
@@ -3446,20 +3425,20 @@ int ieee802_1x_kay_create_sas(struct ieee802_1x_kay *kay,
 	cs = &cipher_suite_tbl[kay->macsec_csindex];
 	if (cs->is_xpn) {
 		/* Calculate SSCIs */
-		u32 ssci = dl_list_len(&principal->rxsc_list) + 1;
-		dl_list_for_each(rxsc, &principal->rxsc_list, struct receive_sc, list) {
-			if (os_memcmp(&rxsc->sci, &principal->txsc->sci,
+		u32 ssci = dl_list_len(&kay->rxsc_list) + 1;
+		dl_list_for_each(rxsc, &kay->rxsc_list, struct receive_sc, list) {
+			if (os_memcmp(&rxsc->sci, &kay->txsc->sci,
 				      sizeof(struct ieee802_1x_mka_sci)) > 0) {
-				principal->txsc->ssci = ssci--;
+				kay->txsc->ssci = ssci--;
 			}
 			rxsc->ssci = ssci--;
 		}
 		if (ssci) {
-			principal->txsc->ssci = ssci--;
+			kay->txsc->ssci = ssci--;
 		}
 	}
 
-	dl_list_for_each(rxsc, &principal->rxsc_list, struct receive_sc, list) {
+	dl_list_for_each(rxsc, &kay->rxsc_list, struct receive_sc, list) {
 		while ((rxsa = lookup_rxsa_by_an(rxsc, latest_sak->an)) != NULL)
 			ieee802_1x_delete_receive_sa(kay, rxsa);
 
@@ -3471,11 +3450,11 @@ int ieee802_1x_kay_create_sas(struct ieee802_1x_kay *kay,
 		secy_create_receive_sa(kay, rxsa);
 	}
 
-	while ((txsa = lookup_txsa_by_an(principal->txsc, latest_sak->an)) !=
+	while ((txsa = lookup_txsa_by_an(kay->txsc, latest_sak->an)) !=
 	       NULL)
 		ieee802_1x_delete_transmit_sa(kay, txsa);
 
-	txsa = ieee802_1x_kay_init_transmit_sa(principal->txsc, latest_sak->an,
+	txsa = ieee802_1x_kay_init_transmit_sa(kay->txsc, latest_sak->an,
 					       latest_sak->next_pn ?
 					       latest_sak->next_pn : 1,
 					       latest_sak);
@@ -3508,14 +3487,14 @@ int ieee802_1x_kay_delete_sas(struct ieee802_1x_kay *kay,
 		return -1;
 
 	/* remove the transmit sa */
-	dl_list_for_each_safe(txsa, pre_txsa, &principal->txsc->sa_list,
+	dl_list_for_each_safe(txsa, pre_txsa, &kay->txsc->sa_list,
 			      struct transmit_sa, list) {
 		if (is_ki_equal(&txsa->pkey->key_identifier, ki))
 			ieee802_1x_delete_transmit_sa(kay, txsa);
 	}
 
 	/* remove the receive sa */
-	dl_list_for_each(rxsc, &principal->rxsc_list, struct receive_sc, list) {
+	dl_list_for_each(rxsc, &kay->rxsc_list, struct receive_sc, list) {
 		dl_list_for_each_safe(rxsa, pre_rxsa, &rxsc->sa_list,
 				      struct receive_sa, list) {
 			if (is_ki_equal(&rxsa->pkey->key_identifier, ki))
@@ -3552,7 +3531,7 @@ int ieee802_1x_kay_enable_tx_sas(struct ieee802_1x_kay *kay,
 	if (!principal)
 		return -1;
 
-	dl_list_for_each(txsa, &principal->txsc->sa_list, struct transmit_sa,
+	dl_list_for_each(txsa, &kay->txsc->sa_list, struct transmit_sa,
 			 list) {
 		if (is_ki_equal(&txsa->pkey->key_identifier, lki)) {
 			txsa->in_use = true;
@@ -3581,7 +3560,7 @@ int ieee802_1x_kay_enable_rx_sas(struct ieee802_1x_kay *kay,
 	if (!principal)
 		return -1;
 
-	dl_list_for_each(rxsc, &principal->rxsc_list, struct receive_sc, list) {
+	dl_list_for_each(rxsc, &kay->rxsc_list, struct receive_sc, list) {
 		dl_list_for_each(rxsa, &rxsc->sa_list, struct receive_sa, list)
 		{
 			if (is_ki_equal(&rxsa->pkey->key_identifier, lki)) {
@@ -4084,7 +4063,8 @@ ieee802_1x_kay_init(struct ieee802_1x_kay_ctx *ctx, enum macsec_policy policy,
 		  sizeof(kay->algo_agility));
 
 	dl_list_init(&kay->participant_list);
-
+	dl_list_init(&kay->rxsc_list);
+	kay->txsc = NULL;
 	if (policy != DO_NOT_SECURE &&
 	    secy_get_capability(kay, &kay->macsec_capable) < 0)
 		goto error;
@@ -4325,14 +4305,23 @@ ieee802_1x_kay_create_mka(struct ieee802_1x_kay *kay,
 	participant->new_sak = false;
 	dl_list_init(&participant->sak_list);
 	participant->new_key = NULL;
-	dl_list_init(&participant->rxsc_list);
-	participant->txsc = ieee802_1x_kay_init_transmit_sc(&kay->actor_sci);
+	/* The transmit SC and receive SCs are per-port SecY state shared by all
+	 * participants and live on the KaY; create the transmit SC once, on the
+	 * first participant. */
+	if (!kay->txsc) {
+		kay->txsc = ieee802_1x_kay_init_transmit_sc(&kay->actor_sci);
+		if (!kay->txsc)
+			goto fail;
+		if (secy_create_transmit_sc(kay, kay->txsc)) {
+			ieee802_1x_kay_deinit_transmit_sc(kay, kay->txsc);
+			kay->txsc = NULL;
+			goto fail;
+		}
+	}
 	secy_cp_control_protect_frames(kay, kay->macsec_protect);
 	secy_cp_control_current_cipher_suite(kay, kay->macsec_cs_id);
 	secy_cp_control_replay(kay, kay->macsec_replay_protect,
 			       kay->macsec_replay_window);
-	if (secy_create_transmit_sc(kay, participant->txsc))
-		goto fail;
 
 	/* to derive KEK from CAK and CKN */
 	participant->kek.len = participant->cak.len;
@@ -4382,7 +4371,6 @@ ieee802_1x_kay_create_mka(struct ieee802_1x_kay *kay,
 	return participant;
 
 fail:
-	os_free(participant->txsc);
 	os_free(participant);
 	return NULL;
 }
@@ -4397,7 +4385,6 @@ ieee802_1x_kay_delete_mka(struct ieee802_1x_kay *kay, struct mka_key_name *ckn)
 	struct ieee802_1x_mka_participant *participant;
 	struct ieee802_1x_kay_peer *peer;
 	struct data_key *sak;
-	struct receive_sc *rxsc;
 
 	if (!kay || !ckn)
 		return;
@@ -4420,10 +4407,12 @@ ieee802_1x_kay_delete_mka(struct ieee802_1x_kay *kay, struct mka_key_name *ckn)
 	if (kay->principal_participant == participant)
 		ieee802_1x_kay_set_principal_participant(kay, NULL);
 
-	/* remove live peer */
+	/* remove live peer; each live peer holds a reference on a shared
+	 * receive SC, so drop that reference here. */
 	while (!dl_list_empty(&participant->live_peers)) {
 		peer = dl_list_entry(participant->live_peers.next,
 				     struct ieee802_1x_kay_peer, list);
+		ieee802_1x_kay_deref_receive_sc(kay, &peer->sci);
 		dl_list_del(&peer->list);
 		os_free(peer);
 	}
@@ -4443,12 +4432,14 @@ ieee802_1x_kay_delete_mka(struct ieee802_1x_kay *kay, struct mka_key_name *ckn)
 		dl_list_del(&sak->list);
 		ieee802_1x_kay_deinit_data_key(sak);
 	}
-	while (!dl_list_empty(&participant->rxsc_list)) {
-		rxsc = dl_list_entry(participant->rxsc_list.next,
-				     struct receive_sc, list);
-		ieee802_1x_kay_deinit_receive_sc(participant, rxsc);
+
+	/* The transmit SC (and any receive SCs) are shared per-port SecY state
+	 * on the KaY; tear the transmit SC down only when the last participant
+	 * is removed. */
+	if (dl_list_empty(&kay->participant_list) && kay->txsc) {
+		ieee802_1x_kay_deinit_transmit_sc(kay, kay->txsc);
+		kay->txsc = NULL;
 	}
-	ieee802_1x_kay_deinit_transmit_sc(participant, participant->txsc);
 
 	os_memset(&participant->cak, 0, sizeof(participant->cak));
 	os_memset(&participant->kek, 0, sizeof(participant->kek));
@@ -4665,7 +4656,6 @@ int ieee802_1x_kay_get_macsec(struct ieee802_1x_kay *kay, char *buf,
 {
 	char *pos, *end;
 	int res;
-	struct ieee802_1x_mka_participant *p;
 
 	if (!kay)
 		return 0;
@@ -4692,51 +4682,52 @@ int ieee802_1x_kay_get_macsec(struct ieee802_1x_kay *kay, char *buf,
 		return end - pos;
 	pos += res;
 
-	dl_list_for_each(p, &kay->participant_list,
-			 struct ieee802_1x_mka_participant, list) {
-		struct receive_sc *rxsc;
+	/* The transmit SC and receive SCs are per-port SecY state shared by all
+	 * participants, so report them once for the KaY rather than per CA. */
+	if (kay->txsc) {
 		struct transmit_sa *txsa;
-		struct receive_sa *rxsa;
-		char *pos2 = pos;
 
-		if (p->txsc) {
-			res = os_snprintf(pos2, end - pos2, "\tTXSC: %s\n",
-					  sci_txt(&p->txsc->sci));
-			if (os_snprintf_error(end - pos2, res))
+		res = os_snprintf(pos, end - pos, "\tTXSC: %s\n",
+				  sci_txt(&kay->txsc->sci));
+		if (os_snprintf_error(end - pos, res))
+			return end - pos;
+		pos += res;
+
+		dl_list_for_each(txsa, &kay->txsc->sa_list,
+				 struct transmit_sa, list) {
+			res = os_snprintf(pos, end - pos,
+					  "\t\tAN: %u\tActive: %s\tPN: %" PRIu64 "\n",
+					  txsa->an, yes_no(txsa->in_use),
+					  txsa->next_pn);
+			if (os_snprintf_error(end - pos, res))
 				return end - pos;
-			pos2 += res;
-
-			dl_list_for_each(txsa, &p->txsc->sa_list,
-					 struct transmit_sa, list) {
-				res = os_snprintf(pos2, end - pos2,
-						  "\t\tAN: %u\tActive: %s\tPN: %" PRIu64 "\n",
-						  txsa->an, yes_no(txsa->in_use),
-						  txsa->next_pn);
-				if (os_snprintf_error(end - pos2, res))
-					return end - pos;
-				pos2 += res;
-			}
+			pos += res;
 		}
-		dl_list_for_each(rxsc, &p->rxsc_list, struct receive_sc, list) {
-			res = os_snprintf(pos2, end - pos2, "\tRXSC: %s\n",
-					  sci_txt(&rxsc->sci));
-			if (os_snprintf_error(end - pos2, res))
-				return end - pos;
-			pos2 += res;
+	}
 
-			dl_list_for_each(rxsa, &rxsc->sa_list, struct receive_sa,
-					 list) {
-				res = os_snprintf(pos2, end - pos2,
+	{
+		struct receive_sc *rxsc;
+		struct receive_sa *rxsa;
+
+		dl_list_for_each(rxsc, &kay->rxsc_list, struct receive_sc,
+				 list) {
+			res = os_snprintf(pos, end - pos, "\tRXSC: %s\n",
+					  sci_txt(&rxsc->sci));
+			if (os_snprintf_error(end - pos, res))
+				return end - pos;
+			pos += res;
+
+			dl_list_for_each(rxsa, &rxsc->sa_list,
+					 struct receive_sa, list) {
+				res = os_snprintf(pos, end - pos,
 						  "\t\tAN: %u\tActive: %s\tPN: %" PRIu64 "\n",
 						  rxsa->an, yes_no(rxsa->in_use),
 						  rxsa->next_pn);
-				if (os_snprintf_error(end - pos2, res))
+				if (os_snprintf_error(end - pos, res))
 					return end - pos;
-				pos2 += res;
+				pos += res;
 			}
 		}
-
-		pos = pos2;
 	}
 
 	return pos - buf;

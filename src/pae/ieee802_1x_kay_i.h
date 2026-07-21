@@ -122,9 +122,6 @@ struct ieee802_1x_mka_participant {
 	bool is_elected;
 
 	struct dl_list sak_list;
-	struct dl_list rxsc_list;
-
-	struct transmit_sc *txsc;
 
 	u8 mi[MI_LEN];
 	u32 mn;
