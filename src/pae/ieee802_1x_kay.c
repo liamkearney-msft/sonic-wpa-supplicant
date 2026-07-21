@@ -4593,7 +4593,9 @@ int ieee802_1x_kay_get_status(struct ieee802_1x_kay *kay, char *buf,
 			  kay->failed ? "Yes" : "No",
 			  kay->actor_priority,
 			  kay->key_server_priority,
-			  kay->is_key_server ? "Yes" : "No",
+			  (kay->principal_participant &&
+			   kay->principal_participant->is_key_server) ?
+				"Yes" : "No",
 			  kay->dist_kn - 1,
 			  kay->rcvd_keys,
 			  kay->mka_hello_time);

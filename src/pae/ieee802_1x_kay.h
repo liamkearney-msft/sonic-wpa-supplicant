@@ -222,7 +222,6 @@ struct ieee802_1x_kay {
 
 	/* not defined in IEEE802.1X */
 	struct ieee802_1x_kay_ctx *ctx;
-	bool is_key_server;
 	bool is_obliged_key_server;
 	char if_name[IFNAMSIZ];
 
