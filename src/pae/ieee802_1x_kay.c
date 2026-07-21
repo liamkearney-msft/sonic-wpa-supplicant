@@ -1448,9 +1448,9 @@ ieee802_1x_mka_encode_sak_use_body(
 	/* data delay protect */
 	body->delay_protect = kay->mka_hello_time <= MKA_BOUNDED_HELLO_TIME;
 	/* lowest accept packet numbers */
-	olpn = ieee802_1x_mka_get_lpn(owner, &owner->oki);
+	olpn = ieee802_1x_mka_get_lpn(owner, &kay->oki);
 	body->olpn = host_to_be32(olpn);
-	llpn = ieee802_1x_mka_get_lpn(owner, &owner->lki);
+	llpn = ieee802_1x_mka_get_lpn(owner, &kay->lki);
 	body->llpn = host_to_be32(llpn);
 	/* Only the principal key server drives rekeying (PN exhaustion /
 	 * rekey period). A standby participant must never request a new SAK. */
@@ -1459,7 +1459,7 @@ ieee802_1x_mka_encode_sak_use_body(
 		 * the old key is populated. Therefore we should be checking
 		 * the OLPN most of the time.
 		 */
-		if (owner->lrx) {
+		if (kay->lrx) {
 			if (llpn > kay->pn_exhaustion) {
 				wpa_printf(MSG_WARNING,
 					   "KaY: My LLPN exhaustion");
@@ -1486,21 +1486,21 @@ ieee802_1x_mka_encode_sak_use_body(
 	body->prx = kay->macsec_validate != Strict;
 
 	/* latest key: rx, tx, key server member identifier key number */
-	body->lan = owner->lan;
-	os_memcpy(body->lsrv_mi, owner->lki.mi, sizeof(body->lsrv_mi));
-	body->lkn = host_to_be32(owner->lki.kn);
-	body->lrx = owner->lrx;
-	body->ltx = owner->ltx;
+	body->lan = kay->lan;
+	os_memcpy(body->lsrv_mi, kay->lki.mi, sizeof(body->lsrv_mi));
+	body->lkn = host_to_be32(kay->lki.kn);
+	body->lrx = kay->lrx;
+	body->ltx = kay->ltx;
 
 	/* old key: rx, tx, key server member identifier key number */
-	body->oan = owner->oan;
-	if (owner->oki.kn != owner->lki.kn &&
-	    owner->oki.kn != 0) {
+	body->oan = kay->oan;
+	if (kay->oki.kn != kay->lki.kn &&
+	    kay->oki.kn != 0) {
 		body->otx = true;
 		body->orx = true;
-		os_memcpy(body->osrv_mi, owner->oki.mi,
+		os_memcpy(body->osrv_mi, kay->oki.mi,
 			  sizeof(body->osrv_mi));
-		body->okn = host_to_be32(owner->oki.kn);
+		body->okn = host_to_be32(kay->oki.kn);
 	} else {
 		body->otx = false;
 		body->orx = false;
@@ -2742,14 +2742,14 @@ ieee802_1x_kay_decide_macsec_use(
 		kay->authenticated = true;
 		kay->secured = false;
 		kay->failed = false;
-		os_memset(&participant->lki, 0, sizeof(participant->lki));
-		participant->lan = 0;
-		participant->ltx = false;
-		participant->lrx = false;
-		os_memset(&participant->oki, 0, sizeof(participant->oki));
-		participant->oan = 0;
-		participant->otx = false;
-		participant->orx = false;
+		os_memset(&kay->lki, 0, sizeof(kay->lki));
+		kay->lan = 0;
+		kay->ltx = false;
+		kay->lrx = false;
+		os_memset(&kay->oki, 0, sizeof(kay->oki));
+		kay->oan = 0;
+		kay->otx = false;
+		kay->orx = false;
 		ieee802_1x_cp_connect_authenticated(kay->cp);
 		ieee802_1x_cp_sm_step(kay->cp);
 	}
@@ -2951,29 +2951,15 @@ ieee802_1x_kay_migrate_principal_sas(
 		}
 	}
 
-	/* Carry over the distribution and installed-key state so the new
-	 * principal keeps driving the installed SAK until the next rekey. */
-	os_memcpy(&new_principal->lki, &old->lki, sizeof(new_principal->lki));
-	new_principal->lan = old->lan;
-	new_principal->ltx = old->ltx;
-	new_principal->lrx = old->lrx;
-	os_memcpy(&new_principal->oki, &old->oki, sizeof(new_principal->oki));
-	new_principal->oan = old->oan;
-	new_principal->otx = old->otx;
-	new_principal->orx = old->orx;
+	/* Carry over the distribution state so the new principal keeps driving
+	 * the installed SAK until the next rekey. The latest/old key identity
+	 * (lki/oki/AN/tx/rx) is SecY state held on the KaY, so it needs no
+	 * migration. */
 	new_principal->to_use_sak = old->to_use_sak;
 	new_principal->new_key = old->new_key;
 
 	old->new_key = NULL;
 	old->to_use_sak = false;
-	os_memset(&old->lki, 0, sizeof(old->lki));
-	old->lan = 0;
-	old->ltx = false;
-	old->lrx = false;
-	os_memset(&old->oki, 0, sizeof(old->oki));
-	old->oan = 0;
-	old->otx = false;
-	old->orx = false;
 }
 
 
@@ -3058,15 +3044,15 @@ ieee802_1x_kay_reconcile_principal(struct ieee802_1x_kay *kay)
 		kay->authenticated = false;
 		kay->secured = false;
 		kay->failed = false;
+		os_memset(&kay->lki, 0, sizeof(kay->lki));
+		kay->lan = 0;
+		kay->ltx = false;
+		kay->lrx = false;
+		os_memset(&kay->oki, 0, sizeof(kay->oki));
+		kay->oan = 0;
+		kay->otx = false;
+		kay->orx = false;
 		if (cur) {
-			os_memset(&cur->lki, 0, sizeof(cur->lki));
-			cur->lan = 0;
-			cur->ltx = false;
-			cur->lrx = false;
-			os_memset(&cur->oki, 0, sizeof(cur->oki));
-			cur->oan = 0;
-			cur->otx = false;
-			cur->orx = false;
 			dl_list_for_each_safe(txsa, pre_txsa,
 					      &cur->txsc->sa_list,
 					      struct transmit_sa, list)
@@ -3189,10 +3175,6 @@ static void ieee802_1x_participant_timer(void *eloop_ctx, void *timeout_ctx)
 			participant->advised_capability =
 				MACSEC_CAP_NOT_IMPLEMENTED;
 			participant->to_use_sak = false;
-			participant->ltx = false;
-			participant->lrx = false;
-			participant->otx = false;
-			participant->orx = false;
 			participant->is_key_server = false;
 			participant->is_elected = false;
 		} else {
@@ -3357,29 +3339,20 @@ int ieee802_1x_kay_set_latest_sa_attr(struct ieee802_1x_kay *kay,
 				      struct ieee802_1x_mka_ki *lki, u8 lan,
 				      bool ltx, bool lrx)
 {
-	struct ieee802_1x_mka_participant *principal;
-
-	principal = ieee802_1x_kay_get_principal_participant(kay);
-	if (!principal)
+	/* Guard: only record SecY key state while a CA owns the controlled
+	 * port. The state itself lives on the KaY (one shared SecY), so the
+	 * principal is used only as a "CP is active" check here. */
+	if (!ieee802_1x_kay_get_principal_participant(kay))
 		return -1;
 
 	if (!lki)
-		os_memset(&principal->lki, 0, sizeof(principal->lki));
+		os_memset(&kay->lki, 0, sizeof(kay->lki));
 	else
-		os_memcpy(&principal->lki, lki, sizeof(principal->lki));
+		os_memcpy(&kay->lki, lki, sizeof(kay->lki));
 
-	principal->lan = lan;
-	principal->ltx = ltx;
-	principal->lrx = lrx;
-	if (!lki) {
-		kay->ltx_kn = 0;
-		kay->lrx_kn = 0;
-	} else {
-		kay->ltx_kn = lki->kn;
-		kay->lrx_kn = lki->kn;
-	}
-	kay->ltx_an = lan;
-	kay->lrx_an = lan;
+	kay->lan = lan;
+	kay->ltx = ltx;
+	kay->lrx = lrx;
 
 	return 0;
 }
@@ -3392,30 +3365,19 @@ int ieee802_1x_kay_set_old_sa_attr(struct ieee802_1x_kay *kay,
 				   struct ieee802_1x_mka_ki *oki,
 				   u8 oan, bool otx, bool orx)
 {
-	struct ieee802_1x_mka_participant *principal;
-
-	principal = ieee802_1x_kay_get_principal_participant(kay);
-	if (!principal)
+	/* See ieee802_1x_kay_set_latest_sa_attr(): the state lives on the KaY;
+	 * the principal is only a "CP is active" guard. */
+	if (!ieee802_1x_kay_get_principal_participant(kay))
 		return -1;
 
 	if (!oki)
-		os_memset(&principal->oki, 0, sizeof(principal->oki));
+		os_memset(&kay->oki, 0, sizeof(kay->oki));
 	else
-		os_memcpy(&principal->oki, oki, sizeof(principal->oki));
+		os_memcpy(&kay->oki, oki, sizeof(kay->oki));
 
-	principal->oan = oan;
-	principal->otx = otx;
-	principal->orx = orx;
-
-	if (!oki) {
-		kay->otx_kn = 0;
-		kay->orx_kn = 0;
-	} else {
-		kay->otx_kn = oki->kn;
-		kay->orx_kn = oki->kn;
-	}
-	kay->otx_an = oan;
-	kay->orx_an = oan;
+	kay->oan = oan;
+	kay->otx = otx;
+	kay->orx = orx;
 
 	return 0;
 }
@@ -4358,10 +4320,6 @@ ieee802_1x_kay_create_mka(struct ieee802_1x_kay *kay,
 	wpa_printf(MSG_DEBUG, "KaY: Selected random MI: %s",
 		   mi_txt(participant->mi));
 
-	participant->lrx = false;
-	participant->ltx = false;
-	participant->orx = false;
-	participant->otx = false;
 	participant->to_dist_sak = false;
 	participant->to_use_sak = false;
 	participant->new_sak = false;

@@ -199,15 +199,19 @@ struct ieee802_1x_kay {
 	enum confidentiality_offset macsec_confidentiality;
 	u32 mka_hello_time;
 
-	u32 ltx_kn;
-	u8 ltx_an;
-	u32 lrx_kn;
-	u8 lrx_an;
+	/* State of the single installed SAK in the SecY (one SecY per port).
+	 * MKA reports this in every SAK Use body. It belongs to the KaY, not to
+	 * a per-CA participant: there is one shared SecY, and the principal
+	 * (CP-owning) CA merely reports its state. */
+	struct ieee802_1x_mka_ki lki;
+	u8 lan;
+	bool ltx;
+	bool lrx;
 
-	u32 otx_kn;
-	u8 otx_an;
-	u32 orx_kn;
-	u8 orx_an;
+	struct ieee802_1x_mka_ki oki;
+	u8 oan;
+	bool otx;
+	bool orx;
 
 	/* not defined in IEEE802.1X */
 	struct ieee802_1x_kay_ctx *ctx;

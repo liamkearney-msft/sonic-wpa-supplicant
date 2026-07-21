@@ -116,16 +116,6 @@ struct ieee802_1x_mka_participant {
 	struct mka_key kek;
 	struct mka_key ick;
 
-	struct ieee802_1x_mka_ki lki;
-	u8 lan;
-	bool ltx;
-	bool lrx;
-
-	struct ieee802_1x_mka_ki oki;
-	u8 oan;
-	bool otx;
-	bool orx;
-
 	bool is_key_server;
 	bool is_obliged_key_server;
 	bool can_be_key_server;
