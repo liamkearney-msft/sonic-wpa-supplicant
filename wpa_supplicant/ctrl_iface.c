@@ -35,6 +35,8 @@
 #include "fst/fst_ctrl_iface.h"
 #include "config.h"
 #include "wpa_supplicant_i.h"
+#include "pae/ieee802_1x_kay.h"
+#include "wpas_kay.h"
 #include "driver_i.h"
 #include "wps_supplicant.h"
 #include "ibss_rsn.h"
@@ -10406,6 +10408,103 @@ static int wpas_ctrl_iface_configure_mscs(struct wpa_supplicant *wpa_s,
 }
 
 
+#ifdef CONFIG_MACSEC
+
+static int wpas_ctrl_iface_macsec_add_mka(struct wpa_supplicant *wpa_s,
+					  char *cmd)
+{
+	u8 ckn[MAX_CKN_LEN];
+	u8 cak[MACSEC_CAK_MAX_LEN];
+	size_t ckn_len = 0, cak_len = 0;
+	int fallback = 0;
+	char *token, *context = NULL;
+
+	while ((token = str_token(cmd, " ", &context))) {
+		if (os_strncmp(token, "ckn=", 4) == 0) {
+			size_t hexlen = os_strlen(token + 4);
+
+			if (hexlen == 0 || (hexlen & 1) ||
+			    hexlen / 2 > sizeof(ckn) ||
+			    hexstr2bin(token + 4, ckn, hexlen / 2) < 0) {
+				wpa_printf(MSG_INFO, "CTRL: Invalid ckn");
+				return -1;
+			}
+			ckn_len = hexlen / 2;
+		} else if (os_strncmp(token, "cak=", 4) == 0) {
+			size_t hexlen = os_strlen(token + 4);
+
+			if (hexlen == 0 || (hexlen & 1) ||
+			    hexlen / 2 > sizeof(cak) ||
+			    hexstr2bin(token + 4, cak, hexlen / 2) < 0) {
+				wpa_printf(MSG_INFO, "CTRL: Invalid cak");
+				forced_memzero(cak, sizeof(cak));
+				return -1;
+			}
+			cak_len = hexlen / 2;
+		} else if (os_strcmp(token, "fallback=1") == 0) {
+			fallback = 1;
+		} else if (os_strcmp(token, "fallback=0") == 0) {
+			fallback = 0;
+		} else {
+			wpa_printf(MSG_INFO, "CTRL: Unknown MACSEC_ADD_MKA arg '%s'",
+				   token);
+			forced_memzero(cak, sizeof(cak));
+			return -1;
+		}
+	}
+
+	if (ckn_len == 0 || cak_len == 0) {
+		wpa_printf(MSG_INFO, "CTRL: MACSEC_ADD_MKA needs ckn and cak");
+		forced_memzero(cak, sizeof(cak));
+		return -1;
+	}
+
+	if (wpas_macsec_add_mka(wpa_s, ckn, ckn_len, cak, cak_len, fallback)) {
+		forced_memzero(cak, sizeof(cak));
+		return -1;
+	}
+
+	forced_memzero(cak, sizeof(cak));
+	return 0;
+}
+
+
+static int wpas_ctrl_iface_macsec_del_mka(struct wpa_supplicant *wpa_s,
+					  char *cmd)
+{
+	u8 ckn[MAX_CKN_LEN];
+	size_t ckn_len = 0;
+	char *token, *context = NULL;
+
+	while ((token = str_token(cmd, " ", &context))) {
+		if (os_strncmp(token, "ckn=", 4) == 0) {
+			size_t hexlen = os_strlen(token + 4);
+
+			if (hexlen == 0 || (hexlen & 1) ||
+			    hexlen / 2 > sizeof(ckn) ||
+			    hexstr2bin(token + 4, ckn, hexlen / 2) < 0) {
+				wpa_printf(MSG_INFO, "CTRL: Invalid ckn");
+				return -1;
+			}
+			ckn_len = hexlen / 2;
+		} else {
+			wpa_printf(MSG_INFO, "CTRL: Unknown MACSEC_DEL_MKA arg '%s'",
+				   token);
+			return -1;
+		}
+	}
+
+	if (ckn_len == 0) {
+		wpa_printf(MSG_INFO, "CTRL: MACSEC_DEL_MKA needs ckn");
+		return -1;
+	}
+
+	return wpas_macsec_del_mka(wpa_s, ckn, ckn_len);
+}
+
+#endif /* CONFIG_MACSEC */
+
+
 char * wpa_supplicant_ctrl_iface_process(struct wpa_supplicant *wpa_s,
 					 char *buf, size_t *resp_len)
 {
@@ -10473,6 +10572,18 @@ char * wpa_supplicant_ctrl_iface_process(struct wpa_supplicant *wpa_s,
 		reply_len = wpa_supplicant_ctrl_iface_status(
 			wpa_s, buf + 6, reply, reply_size);
 #ifdef CONFIG_MACSEC
+	} else if (os_strncmp(buf, "MACSEC_ADD_MKA ", 15) == 0) {
+		if (wpas_ctrl_iface_macsec_add_mka(wpa_s, buf + 15))
+			reply_len = -1;
+	} else if (os_strncmp(buf, "MACSEC_DEL_MKA ", 15) == 0) {
+		if (wpas_ctrl_iface_macsec_del_mka(wpa_s, buf + 15))
+			reply_len = -1;
+	} else if (os_strcmp(buf, "MACSEC_MKA_LIST") == 0) {
+		reply_len = ieee802_1x_kay_get_status(wpa_s->kay, reply,
+						      reply_size);
+	} else if (os_strcmp(buf, "MACSEC_REKEY") == 0) {
+		if (!wpa_s->kay || ieee802_1x_kay_new_sak(wpa_s->kay))
+			reply_len = -1;
 	} else if (os_strncmp(buf, "MACSEC", 6) == 0) {
 		reply_len = ieee802_1x_kay_get_macsec(wpa_s->kay, reply,
 						      reply_size);

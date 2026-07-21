@@ -4232,6 +4232,16 @@ ieee802_1x_kay_create_mka(struct ieee802_1x_kay *kay,
 		return NULL;
 	}
 
+	/* A CKN uniquely identifies a participant (CA). Refuse to create a
+	 * second participant for a CKN that is already active so that the
+	 * primary and fallback participants (and any runtime-added MKA) never
+	 * collide on the same key. */
+	if (ieee802_1x_kay_get_participant(kay, ckn->name, ckn->len)) {
+		wpa_printf(MSG_INFO,
+			   "KaY: participant for this CKN already exists");
+		return NULL;
+	}
+
 	participant = os_zalloc(sizeof(*participant));
 	if (!participant) {
 		wpa_printf(MSG_ERROR, "KaY-%s: out of memory", __func__);
@@ -4445,6 +4455,12 @@ ieee802_1x_kay_delete_mka(struct ieee802_1x_kay *kay, struct mka_key_name *ckn)
 	os_memset(&participant->kek, 0, sizeof(participant->kek));
 	os_memset(&participant->ick, 0, sizeof(participant->ick));
 	os_free(participant);
+
+	/* If any participants remain, re-run the election so a surviving CA
+	 * (e.g. the fallback) immediately reclaims the controlled port instead
+	 * of waiting for the next peer event. */
+	if (!dl_list_empty(&kay->participant_list))
+		ieee802_1x_kay_reconcile_principal(kay);
 }
 
 
@@ -4618,6 +4634,8 @@ int ieee802_1x_kay_get_status(struct ieee802_1x_kay *kay, char *buf,
 				  "active=%s\n"
 				  "participant=%s\n"
 				  "retain=%s\n"
+				  "is_principal=%s\n"
+				  "is_fallback=%s\n"
 				  "live_peers=%u\n"
 				  "potential_peers=%u\n"
 				  "is_key_server=%s\n"
@@ -4626,6 +4644,8 @@ int ieee802_1x_kay_get_status(struct ieee802_1x_kay *kay, char *buf,
 				  yes_no(p->active),
 				  yes_no(p->participant),
 				  yes_no(p->retain),
+				  yes_no(kay->principal_participant == p),
+				  yes_no(p->is_fallback),
 				  dl_list_len(&p->live_peers),
 				  dl_list_len(&p->potential_peers),
 				  yes_no(p->is_key_server),

@@ -481,3 +481,91 @@ free_ckn:
 end:
 	return res;
 }
+
+
+/**
+ * wpas_macsec_add_mka - Runtime-create a preshared MKA participant
+ *
+ * Adds an MKA participant (CA) for @ckn/@cak that shares the current KaY and
+ * SecY. Used to install a primary or fallback CAK at run time (e.g. via the
+ * control interface) so that a CAK can be rotated without tearing the port
+ * down. If @fallback is set the participant only owns the controlled port when
+ * the primary CA has no live peer.
+ */
+int wpas_macsec_add_mka(struct wpa_supplicant *wpa_s, const u8 *ckn,
+			size_t ckn_len, const u8 *cak, size_t cak_len,
+			int fallback)
+{
+	struct mka_key_name ckn_s;
+	struct mka_key cak_s;
+	struct ieee802_1x_mka_participant *participant;
+
+	if (!wpa_s->kay) {
+		wpa_printf(MSG_INFO, "MACsec: KaY is not active on %s",
+			   wpa_s->ifname);
+		return -1;
+	}
+	if (ckn_len == 0 || ckn_len > MAX_CKN_LEN) {
+		wpa_printf(MSG_INFO, "MACsec: Invalid CKN length %u",
+			   (unsigned int) ckn_len);
+		return -1;
+	}
+	if (cak_len != 16 && cak_len != 32) {
+		wpa_printf(MSG_INFO, "MACsec: Invalid CAK length %u",
+			   (unsigned int) cak_len);
+		return -1;
+	}
+
+	os_memset(&ckn_s, 0, sizeof(ckn_s));
+	ckn_s.len = ckn_len;
+	os_memcpy(ckn_s.name, ckn, ckn_len);
+
+	os_memset(&cak_s, 0, sizeof(cak_s));
+	cak_s.len = cak_len;
+	os_memcpy(cak_s.key, cak, cak_len);
+
+	participant = ieee802_1x_kay_create_mka(wpa_s->kay, &ckn_s, &cak_s, 0,
+						PSK, false);
+	forced_memzero(&cak_s, sizeof(cak_s));
+	if (!participant) {
+		wpa_printf(MSG_INFO, "MACsec: Failed to add MKA participant");
+		return -1;
+	}
+
+	if (fallback)
+		ieee802_1x_kay_set_participant_fallback(participant, true);
+
+	return 0;
+}
+
+
+/**
+ * wpas_macsec_del_mka - Runtime-remove a preshared MKA participant
+ *
+ * Removes the MKA participant identified by @ckn. If it was the CP owner, the
+ * KaY re-runs its election so a surviving CA takes over the controlled port.
+ */
+int wpas_macsec_del_mka(struct wpa_supplicant *wpa_s, const u8 *ckn,
+			size_t ckn_len)
+{
+	struct mka_key_name ckn_s;
+
+	if (!wpa_s->kay) {
+		wpa_printf(MSG_INFO, "MACsec: KaY is not active on %s",
+			   wpa_s->ifname);
+		return -1;
+	}
+	if (ckn_len == 0 || ckn_len > MAX_CKN_LEN) {
+		wpa_printf(MSG_INFO, "MACsec: Invalid CKN length %u",
+			   (unsigned int) ckn_len);
+		return -1;
+	}
+
+	os_memset(&ckn_s, 0, sizeof(ckn_s));
+	ckn_s.len = ckn_len;
+	os_memcpy(ckn_s.name, ckn, ckn_len);
+
+	ieee802_1x_kay_delete_mka(wpa_s->kay, &ckn_s);
+
+	return 0;
+}
