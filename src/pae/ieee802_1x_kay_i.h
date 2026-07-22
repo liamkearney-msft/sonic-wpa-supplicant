@@ -101,8 +101,6 @@ struct ieee802_1x_mka_participant {
 
 	enum activate_ctrl { DEFAULT, DISABLED, ON_OPER_UP, ALWAYS } activate;
 
-	/* used for active participant */
-	bool principal;
 	/* Lower-priority standby CA: only owns the controlled port when the
 	 * primary CA has no live peer. The primary (non-fallback) CA is
 	 * preferred and reclaims ownership as soon as it is live again. */

@@ -368,26 +368,17 @@ ieee802_1x_kay_get_participant(struct ieee802_1x_kay *kay, const u8 *ckn,
  * The principal participant owns the single CP state machine and SecY (data
  * path) programming. Tracking it as an explicit pointer allows the CP owner to
  * be switched atomically to a fallback CKN without tearing down the data path.
- * The per-participant "principal" flag is kept in sync so that exactly one
- * participant has it set at any time.
  */
 static void
 ieee802_1x_kay_set_principal_participant(
 	struct ieee802_1x_kay *kay,
 	struct ieee802_1x_mka_participant *participant)
 {
-	if (kay->principal_participant == participant) {
-		if (participant)
-			participant->principal = true;
+	if (kay->principal_participant == participant)
 		return;
-	}
-
-	if (kay->principal_participant)
-		kay->principal_participant->principal = false;
 
 	kay->principal_participant = participant;
 	if (participant) {
-		participant->principal = true;
 		wpa_printf(MSG_DEBUG,
 			   "KaY: principal participant (CP owner) set to CKN %s",
 			   mi_txt(participant->mi));
@@ -419,11 +410,7 @@ ieee802_1x_kay_set_participant_fallback(
 static struct ieee802_1x_mka_participant *
 ieee802_1x_kay_get_principal_participant(struct ieee802_1x_kay *kay)
 {
-	if (kay->principal_participant &&
-	    kay->principal_participant->principal)
-		return kay->principal_participant;
-
-	return NULL;
+	return kay->principal_participant;
 }
 
 
@@ -1983,7 +1970,7 @@ ieee802_1x_mka_decode_dist_sak_body(
 	 * If we already own the CP for this CA, the timer-driven election has
 	 * populated key_server_sci; otherwise confirm locally (side-effect free)
 	 * that this peer is the key server we would elect for this CA. */
-	if (participant->principal) {
+	if (participant == kay->principal_participant) {
 		if (!sci_equal(&kay->key_server_sci, &peer->sci)) {
 			wpa_printf(MSG_ERROR, "KaY: The key server is not elected");
 			return -1;
@@ -2015,7 +2002,7 @@ ieee802_1x_mka_decode_dist_sak_body(
 	 * fallback label only steers a key server's own choice, never a
 	 * follower's. This runs only after the sender has been validated as the
 	 * elected key server and a real SAK is present. */
-	if (!participant->principal) {
+	if (participant != kay->principal_participant) {
 		wpa_printf(MSG_INFO,
 			   "KaY: Following key server onto CKN %s for controlled-port ownership",
 			   mi_txt(participant->mi));
@@ -4848,7 +4835,7 @@ int ieee802_1x_kay_get_mib(struct ieee802_1x_kay *kay, char *buf,
 				  true_false(p->active),
 				  true_false(p->retain),
 				  activate_control_txt(p->activate),
-				  true_false(p->principal));
+				  true_false(kay->principal_participant == p));
 		if (os_snprintf_error(buflen, res))
 			return end - pos;
 		pos2 += res;
