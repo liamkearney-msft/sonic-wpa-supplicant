@@ -368,7 +368,21 @@ ieee802_1x_kay_get_participant(struct ieee802_1x_kay *kay, const u8 *ckn,
  * The principal participant owns the single CP state machine and SecY (data
  * path) programming. Tracking it as an explicit pointer allows the CP owner to
  * be switched atomically to a fallback CKN without tearing down the data path.
+ *
+ * Ownership and the installed-SAK bookkeeping are a single unit: whenever the
+ * principal pointer moves, the outgoing principal's SAK list (and the
+ * new_key/to_use_sak distribution state) is re-homed to the incoming one so a
+ * later CP RETIRE can still free it and distribution carries over until the
+ * next rekey. Centralising the migration here keeps that invariant in one place
+ * for every ownership change (failover, revertive fail-back, key-server follow,
+ * participant removal). The migration helper is a no-op when either side is
+ * NULL, so the initial-claim and teardown paths are unaffected.
  */
+static void
+ieee802_1x_kay_migrate_principal_sas(
+	struct ieee802_1x_mka_participant *old,
+	struct ieee802_1x_mka_participant *new_principal);
+
 static void
 ieee802_1x_kay_set_principal_participant(
 	struct ieee802_1x_kay *kay,
@@ -376,6 +390,9 @@ ieee802_1x_kay_set_principal_participant(
 {
 	if (kay->principal_participant == participant)
 		return;
+
+	ieee802_1x_kay_migrate_principal_sas(kay->principal_participant,
+					     participant);
 
 	kay->principal_participant = participant;
 	if (participant) {
@@ -2017,14 +2034,11 @@ ieee802_1x_mka_decode_dist_sak_body(
 	 * follower's. This runs only after the sender has been validated as the
 	 * elected key server and a real SAK is present. */
 	if (!ieee802_1x_kay_is_principal_participant(kay, participant)) {
-		struct ieee802_1x_mka_participant *prev =
-			ieee802_1x_kay_get_principal_participant(kay);
-
 		wpa_printf(MSG_INFO,
 			   "KaY: Following key server onto CKN %s for controlled-port ownership",
 			   mi_txt(participant->mi));
-		if (prev)
-			ieee802_1x_kay_migrate_principal_sas(prev, participant);
+		/* set_principal_participant() re-homes the outgoing principal's
+		 * installed-SAK bookkeeping to this CA. */
 		ieee802_1x_kay_set_principal_participant(kay, participant);
 		ieee802_1x_kay_elect_key_server(participant);
 	}
@@ -3004,81 +3018,141 @@ ieee802_1x_kay_preferred_principal(struct ieee802_1x_kay *kay)
 
 
 /**
- * ieee802_1x_kay_reconcile_principal - Point the CP at the preferred CA
+ * ieee802_1x_kay_live_successor - Find any CA with a live peer to fail over to
  *
- * Recomputes which participant should own the controlled port and, if it has
- * changed, moves ownership there. This single path covers three cases:
- *   - initial claim (no principal yet),
- *   - failover (primary CA lost its last live peer, hand off to a fallback),
- *   - revertive fail-back (primary CA is live again, reclaim from the fallback).
+ * Unlike ieee802_1x_kay_preferred_principal(), this does not require the CA to
+ * already hold a SAK. It is used only at failover, when the outgoing principal
+ * still has an installed SAK that set_principal_participant() will re-home to
+ * the successor. A keyless but live sibling can therefore inherit the
+ * controlled port and keep the data path up under the current key until it is
+ * rekeyed, so the principal pointer never has to pass through NULL while a live
+ * MKA session exists. The primary (non-fallback) CA is preferred. Returns NULL
+ * when no other CA has a live peer.
+ */
+static struct ieee802_1x_mka_participant *
+ieee802_1x_kay_live_successor(struct ieee802_1x_kay *kay,
+			      struct ieee802_1x_mka_participant *exclude)
+{
+	struct ieee802_1x_mka_participant *p, *best = NULL;
+
+	dl_list_for_each(p, &kay->participant_list,
+			 struct ieee802_1x_mka_participant, list) {
+		if (p == exclude)
+			continue;
+		if (!p->active)
+			continue;
+		if (dl_list_empty(&p->live_peers))
+			continue;
+		if (!best) {
+			best = p;
+			continue;
+		}
+		/* Prefer a primary (non-fallback) CA over a fallback one. */
+		if (best->is_fallback && !p->is_fallback)
+			best = p;
+	}
+
+	return best;
+}
+
+
+/**
+ * ieee802_1x_kay_decide_principal - Compute and assign the CP-owning CA
  *
- * On a hand-off the installed SAK and its SAs are re-homed to the new principal
- * so traffic keeps flowing under the current key without tearing down the
- * SecY; the new principal then rekeys (if it is the key server) to distribute
- * fresh SAKs under its own CKN. When no CA has a live peer the data path is
- * torn down.
+ * The single entry point for deciding which participant owns the controlled
+ * port. It is pure accounting - it selects the principal and assigns the
+ * pointer (re-homing the installed-SAK bookkeeping to the new owner via
+ * set_principal_participant) - and performs NO datapath / CP work. The caller
+ * (ieee802_1x_kay_reconcile_principal) acts on the decision.
+ *
+ * Selection order:
+ *   1. The CA that can key the port right now (preferred_principal): our own
+ *      key server, or one already holding a SAK. The primary (non-fallback) CA
+ *      is preferred over a fallback.
+ *   2. Failover: if nothing can currently key the port but the port is already
+ *      secured, hand ownership to any live sibling (live_successor) carrying the
+ *      installed SAK, so a follower whose fallback CA has not yet received its
+ *      own DIST_SAK keeps the data path up under the current key rather than
+ *      black-holing. The pointer therefore never passes through NULL while a
+ *      live MKA session with an installed SAK exists.
+ *
+ * Returns the new principal, or NULL when no CA can own the port (no live peer
+ * anywhere, or cold start before the first SAK when there is nothing to carry).
+ */
+static struct ieee802_1x_mka_participant *
+ieee802_1x_kay_decide_principal(struct ieee802_1x_kay *kay)
+{
+	struct ieee802_1x_mka_participant *want;
+
+	want = ieee802_1x_kay_preferred_principal(kay);
+	if (!want && kay->secured)
+		want = ieee802_1x_kay_live_successor(
+			kay, ieee802_1x_kay_get_principal_participant(kay));
+
+	ieee802_1x_kay_set_principal_participant(kay, want);
+	return want;
+}
+
+
+/**
+ * ieee802_1x_kay_reconcile_principal - Act on the principal decision
+ *
+ * Recomputes the CP owner via ieee802_1x_kay_decide_principal() and then drives
+ * the shared CP / SecY state machine to match. All datapath side effects are
+ * confined here:
+ *   - a new principal    -> re-elect in its CA and drive the CP,
+ *   - the same principal -> refresh the CP decision,
+ *   - no principal       -> tear the data path down.
+ * This single path covers initial claim, failover to a fallback, revertive
+ * fail-back to the primary, and teardown, and is called whenever the live-peer
+ * topology changes.
  */
 static void
 ieee802_1x_kay_reconcile_principal(struct ieee802_1x_kay *kay)
 {
-	struct ieee802_1x_mka_participant *want, *cur;
+	struct ieee802_1x_mka_participant *want, *prev;
 	struct transmit_sa *txsa, *pre_txsa;
 
-	want = ieee802_1x_kay_preferred_principal(kay);
-	cur = ieee802_1x_kay_get_principal_participant(kay);
+	prev = ieee802_1x_kay_get_principal_participant(kay);
+	want = ieee802_1x_kay_decide_principal(kay);
 
-	if (want == cur) {
-		/* No ownership change; just refresh the principal's decision. */
-		if (cur)
-			ieee802_1x_kay_decide_macsec_use(cur);
+	if (want) {
+		/* Only when ownership actually moved: re-run election in the new
+		 * principal's CA so it drives the CP and, if it is the key
+		 * server, arms new_sak to rekey under its own CKN. Doing this on
+		 * every pass would re-arm a rekey each timer tick. */
+		if (want != prev)
+			ieee802_1x_kay_elect_key_server(want);
+		ieee802_1x_kay_decide_macsec_use(want);
 		return;
 	}
 
-	if (!want) {
-		/* No CA has a live peer any more: tear the data path down. */
-		wpa_printf(MSG_INFO,
-			   "KaY: No CA has a live peer; tearing down the controlled port");
-		kay->authenticated = false;
-		kay->secured = false;
-		kay->failed = false;
-		os_memset(&kay->lki, 0, sizeof(kay->lki));
-		kay->lan = 0;
-		kay->ltx = false;
-		kay->lrx = false;
-		os_memset(&kay->oki, 0, sizeof(kay->oki));
-		kay->oan = 0;
-		kay->otx = false;
-		kay->orx = false;
-		if (kay->txsc) {
-			dl_list_for_each_safe(txsa, pre_txsa,
-					      &kay->txsc->sa_list,
-					      struct transmit_sa, list)
-				ieee802_1x_delete_transmit_sa(kay, txsa);
-		}
-		ieee802_1x_kay_set_principal_participant(kay, NULL);
-		ieee802_1x_cp_connect_pending(kay->cp);
-		ieee802_1x_cp_sm_step(kay->cp);
+	/* No CA can own the port. If nothing was up there is nothing to do. */
+	if (!prev)
 		return;
-	}
 
-	/* Move CP ownership to the preferred CA. */
-	if (cur) {
-		wpa_printf(MSG_INFO,
-			   "KaY: Moving controlled-port ownership to %s CKN",
-			   want->is_fallback ? "fallback" : "primary");
-		ieee802_1x_kay_migrate_principal_sas(cur, want);
-	} else {
-		wpa_printf(MSG_INFO,
-			   "KaY: %s CKN claiming controlled-port ownership",
-			   want->is_fallback ? "Fallback" : "Primary");
+	/* Tear the data path down: no usable MKA remains, so there is nothing
+	 * valid left to protect. */
+	wpa_printf(MSG_INFO,
+		   "KaY: No CA has a live peer; tearing down the controlled port");
+	kay->authenticated = false;
+	kay->secured = false;
+	kay->failed = false;
+	os_memset(&kay->lki, 0, sizeof(kay->lki));
+	kay->lan = 0;
+	kay->ltx = false;
+	kay->lrx = false;
+	os_memset(&kay->oki, 0, sizeof(kay->oki));
+	kay->oan = 0;
+	kay->otx = false;
+	kay->orx = false;
+	if (kay->txsc) {
+		dl_list_for_each_safe(txsa, pre_txsa, &kay->txsc->sa_list,
+				      struct transmit_sa, list)
+			ieee802_1x_delete_transmit_sa(kay, txsa);
 	}
-
-	ieee802_1x_kay_set_principal_participant(kay, want);
-	/* Re-run election now that it is the principal so it drives the shared
-	 * CP state machine; if it is the key server this also arms new_sak to
-	 * rekey under its own CKN. */
-	ieee802_1x_kay_elect_key_server(want);
-	ieee802_1x_kay_decide_macsec_use(want);
+	ieee802_1x_cp_connect_pending(kay->cp);
+	ieee802_1x_cp_sm_step(kay->cp);
 }
 
 
@@ -4422,10 +4496,14 @@ ieee802_1x_kay_delete_mka(struct ieee802_1x_kay *kay, struct mka_key_name *ckn)
 	eloop_cancel_timeout(ieee802_1x_participant_timer, participant, NULL);
 	dl_list_del(&participant->list);
 
-	/* If the CP owner is being removed, drop ownership. Any surviving
-	 * participant will (re)claim it on its next election. */
-	if (ieee802_1x_kay_is_principal_participant(kay, participant))
-		ieee802_1x_kay_set_principal_participant(kay, NULL);
+	/* Recompute controlled-port ownership before tearing the participant
+	 * down. If it owned the CP, reconcile_principal() hands ownership (and
+	 * the installed SAK, re-homed by set_principal_participant) to a
+	 * surviving CA that still has a live peer, or tears the data path down
+	 * when none remains - all while this participant's SAK list is still
+	 * intact to be migrated. It is already unlinked, so it is not itself a
+	 * candidate. */
+	ieee802_1x_kay_reconcile_principal(kay);
 
 	/* remove live peer; each live peer holds a reference on a shared
 	 * receive SC, so drop that reference here. */
@@ -4465,12 +4543,6 @@ ieee802_1x_kay_delete_mka(struct ieee802_1x_kay *kay, struct mka_key_name *ckn)
 	os_memset(&participant->kek, 0, sizeof(participant->kek));
 	os_memset(&participant->ick, 0, sizeof(participant->ick));
 	os_free(participant);
-
-	/* If any participants remain, re-run the election so a surviving CA
-	 * (e.g. the fallback) immediately reclaims the controlled port instead
-	 * of waiting for the next peer event. */
-	if (!dl_list_empty(&kay->participant_list))
-		ieee802_1x_kay_reconcile_principal(kay);
 }
 
 
