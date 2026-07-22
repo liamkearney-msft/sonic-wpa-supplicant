@@ -2101,7 +2101,16 @@ ieee802_1x_mka_decode_dist_sak_body(
 	 * ownership for this CA so the port converges on the key server's choice
 	 * rather than deadlocking on a keyless primary. The local primary/
 	 * fallback label only steers a key server's own choice, never a
-	 * follower's. */
+	 * follower's.
+	 *
+	 * This assumes a single key server drives the port at a time, i.e. at
+	 * most one distributing CA (one primary and its fallback, only one of
+	 * which is elected key server on the wire). That is the intended
+	 * deployment. With two independent key servers distributing on
+	 * different CAs simultaneously (a >2-CA misconfiguration) a follower
+	 * would take over onto whichever CA sent the most recent DIST_SAK and
+	 * the controlled port could oscillate; converging that case is out of
+	 * scope. */
 	if (!ieee802_1x_kay_is_principal_participant(kay, participant)) {
 		wpa_printf(MSG_INFO,
 			   "KaY: Following key server onto CKN %s for controlled-port ownership",
