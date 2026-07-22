@@ -1584,17 +1584,25 @@ ieee802_1x_mka_decode_sak_use_body(
 	/* A standby (non-principal) participant may legitimately receive a
 	 * peer's SAK Use that advertises the principal's active SAK. Such a
 	 * participant has no distributed key of its own, so the logic below
-	 * ignores the parameter set gracefully (see the sak_list check). Do
-	 * not reject it here: returning an error would discard the whole
-	 * MKPDU and tear down the fallback CA.
+	 * ignores the parameter set gracefully (see the sak_list check).
+	 *
+	 * Likewise, a SAK Use may arrive from a peer that has already brought
+	 * us into its live-peer list but that we have not yet promoted to live
+	 * on our side (a transient during MKA liveness establishment, and a far
+	 * wider window under rekey/failover churn with a fallback CA). This is a
+	 * timing condition, not an invalid peer: ignore it gracefully and let
+	 * the peer reach LIVE on a subsequent hello, after which its SAK Use is
+	 * processed normally. Returning an error here would discard the whole
+	 * MKPDU and, because a lone SAK Use with no Distributed SAK triggers a
+	 * local MI reset, both ends can ping-pong MI resets and never converge.
 	 */
 	peer = ieee802_1x_kay_get_live_peer(participant,
 					    participant->current_peer_id.mi);
 	if (!peer) {
-		wpa_printf(MSG_WARNING,
-			   "KaY: The peer (%s) is not my live peer - ignore MACsec SAK Use parameter set",
+		wpa_printf(MSG_DEBUG,
+			   "KaY: The peer (%s) is not yet my live peer - ignore MACsec SAK Use parameter set",
 			   mi_txt(participant->current_peer_id.mi));
-		return -1;
+		return 0;
 	}
 
 	hdr = (struct ieee802_1x_mka_hdr *) mka_msg;
