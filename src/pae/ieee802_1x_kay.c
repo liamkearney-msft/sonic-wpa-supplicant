@@ -4292,6 +4292,7 @@ ieee802_1x_kay_create_mka(struct ieee802_1x_kay *kay,
 {
 	struct ieee802_1x_mka_participant *participant;
 	unsigned int usecs;
+	bool created_txsc = false;
 
 	wpa_printf(MSG_DEBUG,
 		   "KaY: Create MKA (ifname=%s mode=%s authenticator=%s)",
@@ -4411,6 +4412,7 @@ ieee802_1x_kay_create_mka(struct ieee802_1x_kay *kay,
 			kay->txsc = NULL;
 			goto fail;
 		}
+		created_txsc = true;
 	}
 	secy_cp_control_protect_frames(kay, kay->macsec_protect);
 	secy_cp_control_current_cipher_suite(kay, kay->macsec_cs_id);
@@ -4465,6 +4467,13 @@ ieee802_1x_kay_create_mka(struct ieee802_1x_kay *kay,
 	return participant;
 
 fail:
+	/* If this call created the shared transmit SC but later setup failed,
+	 * tear it back down so it (and its hardware SC) is not leaked; a prior
+	 * participant that legitimately owns it must be left untouched. */
+	if (created_txsc && kay->txsc) {
+		ieee802_1x_kay_deinit_transmit_sc(kay, kay->txsc);
+		kay->txsc = NULL;
+	}
 	os_free(participant);
 	return NULL;
 }
