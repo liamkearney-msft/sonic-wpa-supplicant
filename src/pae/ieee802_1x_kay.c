@@ -414,6 +414,20 @@ ieee802_1x_kay_get_principal_participant(struct ieee802_1x_kay *kay)
 }
 
 
+/**
+ * ieee802_1x_kay_is_principal_participant - Is this the CP-owning participant?
+ *
+ * Null-safe: a NULL candidate is never the principal.
+ */
+static bool
+ieee802_1x_kay_is_principal_participant(
+	struct ieee802_1x_kay *kay,
+	const struct ieee802_1x_mka_participant *participant)
+{
+	return participant && kay->principal_participant == participant;
+}
+
+
 static struct ieee802_1x_kay_peer * get_peer_mi(struct dl_list *peers,
 						const u8 *mi)
 {
@@ -1970,7 +1984,7 @@ ieee802_1x_mka_decode_dist_sak_body(
 	 * If we already own the CP for this CA, the timer-driven election has
 	 * populated key_server_sci; otherwise confirm locally (side-effect free)
 	 * that this peer is the key server we would elect for this CA. */
-	if (participant == kay->principal_participant) {
+	if (ieee802_1x_kay_is_principal_participant(kay, participant)) {
 		if (!sci_equal(&kay->key_server_sci, &peer->sci)) {
 			wpa_printf(MSG_ERROR, "KaY: The key server is not elected");
 			return -1;
@@ -2002,14 +2016,15 @@ ieee802_1x_mka_decode_dist_sak_body(
 	 * fallback label only steers a key server's own choice, never a
 	 * follower's. This runs only after the sender has been validated as the
 	 * elected key server and a real SAK is present. */
-	if (participant != kay->principal_participant) {
+	if (!ieee802_1x_kay_is_principal_participant(kay, participant)) {
+		struct ieee802_1x_mka_participant *prev =
+			ieee802_1x_kay_get_principal_participant(kay);
+
 		wpa_printf(MSG_INFO,
 			   "KaY: Following key server onto CKN %s for controlled-port ownership",
 			   mi_txt(participant->mi));
-		if (kay->principal_participant &&
-		    kay->principal_participant != participant)
-			ieee802_1x_kay_migrate_principal_sas(
-				kay->principal_participant, participant);
+		if (prev)
+			ieee802_1x_kay_migrate_principal_sas(prev, participant);
 		ieee802_1x_kay_set_principal_participant(kay, participant);
 		ieee802_1x_kay_elect_key_server(participant);
 	}
@@ -2679,7 +2694,7 @@ ieee802_1x_kay_elect_key_server(struct ieee802_1x_mka_participant *participant)
 	 * this participant's own key-server role within its CA; a participant
 	 * that is not (yet) the principal must not drive the shared CP state
 	 * machine, key-server bookkeeping or SAK distribution. */
-	if (participant != kay->principal_participant)
+	if (!ieee802_1x_kay_is_principal_participant(kay, participant))
 		return 0;
 
 	if (i_is_key_server) {
@@ -2734,7 +2749,7 @@ ieee802_1x_kay_decide_macsec_use(
 	 * elect itself key server of its own CA for viability, but it must not
 	 * connect/secure the CP or clear the datapath key state. Its SAK Use is
 	 * mirrored from the principal instead (see get_sak_use_length). */
-	if (participant != kay->principal_participant)
+	if (!ieee802_1x_kay_is_principal_participant(kay, participant))
 		return 0;
 
 	if (!participant->is_key_server)
@@ -3010,7 +3025,7 @@ ieee802_1x_kay_reconcile_principal(struct ieee802_1x_kay *kay)
 	struct transmit_sa *txsa, *pre_txsa;
 
 	want = ieee802_1x_kay_preferred_principal(kay);
-	cur = kay->principal_participant;
+	cur = ieee802_1x_kay_get_principal_participant(kay);
 
 	if (want == cur) {
 		/* No ownership change; just refresh the principal's decision. */
@@ -4264,7 +4279,7 @@ ieee802_1x_kay_create_mka(struct ieee802_1x_kay *kay,
 			/* Only seed the shared key-server bookkeeping if this
 			 * participant will become the CP owner (principal).
 			 * Additional participants are standbys until failover. */
-			if (!kay->principal_participant) {
+			if (!ieee802_1x_kay_get_principal_participant(kay)) {
 				os_memcpy(&kay->key_server_sci,
 					  &kay->actor_sci,
 					  sizeof(kay->key_server_sci));
@@ -4409,7 +4424,7 @@ ieee802_1x_kay_delete_mka(struct ieee802_1x_kay *kay, struct mka_key_name *ckn)
 
 	/* If the CP owner is being removed, drop ownership. Any surviving
 	 * participant will (re)claim it on its next election. */
-	if (kay->principal_participant == participant)
+	if (ieee802_1x_kay_is_principal_participant(kay, participant))
 		ieee802_1x_kay_set_principal_participant(kay, NULL);
 
 	/* remove live peer; each live peer holds a reference on a shared
@@ -4564,12 +4579,15 @@ int ieee802_1x_kay_get_status(struct ieee802_1x_kay *kay, char *buf,
 	char *pos, *end;
 	int res, count;
 	struct ieee802_1x_mka_participant *p;
+	struct ieee802_1x_mka_participant *principal;
 
 	if (!kay)
 		return 0;
 
 	pos = buf;
 	end = buf + buflen;
+
+	principal = ieee802_1x_kay_get_principal_participant(kay);
 
 	res = os_snprintf(pos, end - pos,
 			  "PAE KaY status=%s\n"
@@ -4588,8 +4606,7 @@ int ieee802_1x_kay_get_status(struct ieee802_1x_kay *kay, char *buf,
 			  kay->failed ? "Yes" : "No",
 			  kay->actor_priority,
 			  kay->key_server_priority,
-			  (kay->principal_participant &&
-			   kay->principal_participant->is_key_server) ?
+			  (principal && principal->is_key_server) ?
 				"Yes" : "No",
 			  kay->dist_kn - 1,
 			  kay->rcvd_keys,
@@ -4641,7 +4658,7 @@ int ieee802_1x_kay_get_status(struct ieee802_1x_kay *kay, char *buf,
 				  yes_no(p->active),
 				  yes_no(p->participant),
 				  yes_no(p->retain),
-				  yes_no(kay->principal_participant == p),
+				  yes_no(ieee802_1x_kay_is_principal_participant(kay, p)),
 				  yes_no(p->is_fallback),
 				  dl_list_len(&p->live_peers),
 				  dl_list_len(&p->potential_peers),
@@ -4835,7 +4852,7 @@ int ieee802_1x_kay_get_mib(struct ieee802_1x_kay *kay, char *buf,
 				  true_false(p->active),
 				  true_false(p->retain),
 				  activate_control_txt(p->activate),
-				  true_false(kay->principal_participant == p));
+				  true_false(ieee802_1x_kay_is_principal_participant(kay, p)));
 		if (os_snprintf_error(buflen, res))
 			return end - pos;
 		pos2 += res;
