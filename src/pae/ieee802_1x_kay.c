@@ -3283,11 +3283,26 @@ static void ieee802_1x_participant_timer(void *eloop_ctx, void *timeout_ctx)
 		}
 	}
 
-	if (participant->new_sak && participant->is_key_server) {
-		if (!ieee802_1x_kay_generate_new_sak(participant))
-			participant->to_dist_sak = true;
-
+	/* Only the principal (controlled-port owner) distributes SAKs. If this
+	 * participant is still flagged key server but is no longer the principal
+	 * (e.g. the port has failed over to another CA), drop any rekey it was
+	 * holding so a demoted CA cannot distribute a SAK. */
+	if (participant->is_key_server &&
+	    ieee802_1x_kay_is_principal_participant(kay, participant)) {
+		if (participant->new_sak) {
+			/* Clear new_sak only once a SAK is actually generated.
+			 * generate_new_sak() fails transiently while the shared
+			 * dist_time holdoff has not elapsed; clearing it
+			 * unconditionally would drop the pending rekey entirely
+			 * until something re-arms new_sak. */
+			if (!ieee802_1x_kay_generate_new_sak(participant)) {
+				participant->to_dist_sak = true;
+				participant->new_sak = false;
+			}
+		}
+	} else {
 		participant->new_sak = false;
+		participant->to_dist_sak = false;
 	}
 
 	if (participant->retry_count < MAX_RETRY_CNT ||
