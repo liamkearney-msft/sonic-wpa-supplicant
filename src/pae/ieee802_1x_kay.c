@@ -2976,21 +2976,18 @@ ieee802_1x_kay_migrate_principal_sas(
  * primary (non-fallback) CA over a fallback; a candidate is always active with
  * at least one live peer. Two knobs specialise it:
  *
- *   require_keyable - restrict to CAs that can key the port now: we are its
- *       elected key server (will distribute a SAK) or it already holds one.
- *       This makes a follower defer to the key server instead of grabbing the
- *       CP for its keyless primary CA (which would fight the key server and
- *       blackhole traffic). When false, any live sibling qualifies - used at
- *       failover, where the outgoing principal's installed SAK is re-homed to
- *       the successor so a keyless but live CA keeps the data path up until it
- *       is rekeyed.
+ *   key_server_only - restrict to CAs where we are the elected key server.
+ *       Primary preference (revertive fail-back) only applies to the key
+ *       server, since only it chooses which CA distributes; a follower instead
+ *       stays on whichever CA the key server is distributing on. Used for the
+ *       revertive pass in decide_principal.
  *
  *   exclude - a participant to skip (the one being failed away from), or NULL.
  *
  * Returns the selected participant, or NULL when no CA qualifies.
  */
 static struct ieee802_1x_mka_participant *
-ieee802_1x_kay_select_principal(struct ieee802_1x_kay *kay, bool require_keyable,
+ieee802_1x_kay_select_principal(struct ieee802_1x_kay *kay, bool key_server_only,
 				struct ieee802_1x_mka_participant *exclude)
 {
 	struct ieee802_1x_mka_participant *p, *best = NULL;
@@ -3003,14 +3000,8 @@ ieee802_1x_kay_select_principal(struct ieee802_1x_kay *kay, bool require_keyable
 			continue;
 		if (dl_list_empty(&p->live_peers))
 			continue;
-		if (require_keyable) {
-			if (!p->is_elected)
-				continue;
-			/* Our own key server (will distribute) or already
-			 * holding a SAK from the key server. */
-			if (!p->is_key_server && dl_list_empty(&p->sak_list))
-				continue;
-		}
+		if (key_server_only && !(p->is_elected && p->is_key_server))
+			continue;
 		if (!best) {
 			best = p;
 			continue;
@@ -3033,26 +3024,33 @@ ieee802_1x_kay_select_principal(struct ieee802_1x_kay *kay, bool require_keyable
  * (reconcile_principal) acts on the decision.
  *
  * Selection order:
- *   1. The CA that can key the port now (require_keyable): our own key server,
- *      or one already holding a SAK; primary preferred over fallback.
- *   2. Failover: if none can key but the port is already secured, hand
- *      ownership to any live sibling carrying the installed SAK (excluding the
- *      outgoing principal), so a follower whose fallback CA has not yet
- *      received its DIST_SAK keeps the data path up. The pointer therefore
- *      never passes through NULL while a live SAK-bearing MKA session exists.
+ *   1. Revertive: if we are the key server on any live CA, own the
+ *      primary-preferred one and drive rekey under its CKN.
+ *   2. Follower: otherwise stay on the CA the key server is currently
+ *      distributing on (the current principal, kept while it has a live peer).
+ *      A follower does not apply primary preference - it uses whatever CA the
+ *      key server keys, which the DIST_SAK takeover already points us at.
+ *   3. Follower failover: if the current principal has no live peer but the
+ *      port is secured, hand ownership to any live sibling carrying the
+ *      installed SAK, so the data path stays up until the next rekey. The
+ *      pointer therefore never passes through NULL while a live SAK-bearing
+ *      MKA session exists.
  *
  * Returns the new principal, or NULL when no CA can own the port.
  */
 static struct ieee802_1x_mka_participant *
 ieee802_1x_kay_decide_principal(struct ieee802_1x_kay *kay)
 {
-	struct ieee802_1x_mka_participant *want;
+	struct ieee802_1x_mka_participant *want, *cur;
 
 	want = ieee802_1x_kay_select_principal(kay, true, NULL);
-	if (!want && kay->secured)
-		want = ieee802_1x_kay_select_principal(
-			kay, false,
-			ieee802_1x_kay_get_principal_participant(kay));
+	if (!want) {
+		cur = ieee802_1x_kay_get_principal_participant(kay);
+		if (cur && cur->active && !dl_list_empty(&cur->live_peers))
+			want = cur;
+		else if (kay->secured)
+			want = ieee802_1x_kay_select_principal(kay, false, cur);
+	}
 
 	ieee802_1x_kay_set_principal_participant(kay, want);
 	return want;
