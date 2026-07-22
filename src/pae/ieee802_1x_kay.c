@@ -1957,6 +1957,7 @@ ieee802_1x_mka_decode_dist_sak_body(
 	size_t body_len;
 	struct data_key *sa_key = NULL;
 	int sak_len;
+	unsigned int csindex;
 	u8 *wrap_sak;
 	u8 *unwrap_sak;
 	struct ieee802_1x_kay *kay = participant->kay;
@@ -2012,43 +2013,25 @@ ieee802_1x_mka_decode_dist_sak_body(
 	}
 
 	if (body_len == 0) {
-		kay->authenticated = true;
-		kay->secured = false;
-		kay->failed = false;
+		struct ieee802_1x_mka_participant *principal =
+			ieee802_1x_kay_get_principal_participant(kay);
+
 		participant->advised_desired = false;
-		ieee802_1x_cp_connect_authenticated(kay->cp);
-		ieee802_1x_cp_sm_step(kay->cp);
-		wpa_printf(MSG_WARNING, "KaY: The Key server advise no MACsec");
 		participant->to_use_sak = false;
+		/* Only the controlled-port owner (or nobody, at cold start) may
+		 * downgrade the shared data path. A standby/fallback CA whose own
+		 * key server advises no MACsec must not tear down another CA's
+		 * live MACsec session. */
+		if (!principal || principal == participant) {
+			kay->authenticated = true;
+			kay->secured = false;
+			kay->failed = false;
+			ieee802_1x_cp_connect_authenticated(kay->cp);
+			ieee802_1x_cp_sm_step(kay->cp);
+		}
+		wpa_printf(MSG_WARNING, "KaY: The Key server advise no MACsec");
 		return 0;
 	}
-
-	/* Follow the key server. The key server is the single authority for the
-	 * SAK on the wire, and it distributes only on the CA it has chosen to
-	 * own the controlled port. If that CA is not the one we currently treat
-	 * as principal (e.g. it is our locally-configured fallback CKN, or the
-	 * key server has just reverted/failed over to another CKN), take over CP
-	 * ownership for this CA so the port converges on the key server's choice
-	 * rather than deadlocking on a keyless primary. The local primary/
-	 * fallback label only steers a key server's own choice, never a
-	 * follower's. This runs only after the sender has been validated as the
-	 * elected key server and a real SAK is present. */
-	if (!ieee802_1x_kay_is_principal_participant(kay, participant)) {
-		wpa_printf(MSG_INFO,
-			   "KaY: Following key server onto CKN %s for controlled-port ownership",
-			   mi_txt(participant->mi));
-		/* set_principal_participant() re-homes the outgoing principal's
-		 * installed-SAK bookkeeping to this CA. */
-		ieee802_1x_kay_set_principal_participant(kay, participant);
-		ieee802_1x_kay_elect_key_server(participant);
-	}
-
-	participant->advised_desired = true;
-	kay->authenticated = false;
-	kay->secured = true;
-	kay->failed = false;
-	ieee802_1x_cp_connect_secure(kay->cp);
-	ieee802_1x_cp_sm_step(kay->cp);
 
 	body = (struct ieee802_1x_mka_dist_sak_body *)mka_msg;
 	ieee802_1x_mka_dump_dist_sak_body(body);
@@ -2063,12 +2046,16 @@ ieee802_1x_mka_decode_dist_sak_body(
 		}
 	}
 
+	/* Validate the cipher suite and unwrap the SAK into locals BEFORE
+	 * committing any ownership or data-path change. A malformed or
+	 * unsupported SAK must be rejected without moving controlled-port
+	 * ownership to this CA, driving the CP to secure, or half-updating the
+	 * shared cipher-suite selection. */
 	if (body_len == 28) {
 		sak_len = DEFAULT_SA_KEY_LEN;
-		wrap_sak =  body->sak;
-		kay->macsec_csindex = DEFAULT_CS_INDEX;
-		cs = &cipher_suite_tbl[kay->macsec_csindex];
-		kay->macsec_cs_id = cs->id;
+		wrap_sak = body->sak;
+		csindex = DEFAULT_CS_INDEX;
+		cs = &cipher_suite_tbl[csindex];
 	} else {
 		unsigned int idx;
 
@@ -2081,7 +2068,7 @@ ieee802_1x_mka_decode_dist_sak_body(
 		}
 		sak_len = cs->sak_len;
 		wrap_sak = body->sak + CS_ID_LEN;
-		kay->macsec_csindex = idx;
+		csindex = idx;
 	}
 
 	unwrap_sak = os_zalloc(sak_len);
@@ -2103,6 +2090,38 @@ ieee802_1x_mka_decode_dist_sak_body(
 		os_free(unwrap_sak);
 		return -1;
 	}
+
+	/* SAK validated. Everything below commits state and does not fail. */
+
+	/* Follow the key server. The key server is the single authority for the
+	 * SAK on the wire, and it distributes only on the CA it has chosen to
+	 * own the controlled port. If that CA is not the one we currently treat
+	 * as principal (e.g. it is our locally-configured fallback CKN, or the
+	 * key server has just reverted/failed over to another CKN), take over CP
+	 * ownership for this CA so the port converges on the key server's choice
+	 * rather than deadlocking on a keyless primary. The local primary/
+	 * fallback label only steers a key server's own choice, never a
+	 * follower's. */
+	if (!ieee802_1x_kay_is_principal_participant(kay, participant)) {
+		wpa_printf(MSG_INFO,
+			   "KaY: Following key server onto CKN %s for controlled-port ownership",
+			   mi_txt(participant->mi));
+		/* set_principal_participant() re-homes the outgoing principal's
+		 * installed-SAK bookkeeping to this CA. */
+		ieee802_1x_kay_set_principal_participant(kay, participant);
+		ieee802_1x_kay_elect_key_server(participant);
+	}
+
+	kay->macsec_csindex = csindex;
+	if (body_len == 28)
+		kay->macsec_cs_id = cs->id;
+
+	participant->advised_desired = true;
+	kay->authenticated = false;
+	kay->secured = true;
+	kay->failed = false;
+	ieee802_1x_cp_connect_secure(kay->cp);
+	ieee802_1x_cp_sm_step(kay->cp);
 
 	os_memcpy(sa_key->key_identifier.mi, participant->current_peer_id.mi,
 		  MI_LEN);
