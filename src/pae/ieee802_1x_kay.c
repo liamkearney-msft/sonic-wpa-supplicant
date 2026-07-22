@@ -1996,18 +1996,32 @@ ieee802_1x_mka_decode_dist_sak_body(
 		return -1;
 	}
 
-	/* Validate that the sender is the key server this CA has actually
-	 * elected BEFORE mutating any shared principal/SecY state, so that a
-	 * rejected DIST_SAK can never disturb the current controlled-port owner.
-	 * If we already own the CP for this CA, the timer-driven election has
-	 * populated key_server_sci; otherwise confirm locally (side-effect free)
-	 * that this peer is the key server we would elect for this CA. */
-	if (ieee802_1x_kay_is_principal_participant(kay, participant)) {
-		if (!sci_equal(&kay->key_server_sci, &peer->sci)) {
-			wpa_printf(MSG_ERROR, "KaY: The key server is not elected");
-			return -1;
-		}
-	} else if (!ieee802_1x_kay_peer_is_elected_key_server(participant, peer)) {
+	/* Validate that the sender is the key server this CA would elect BEFORE
+	 * mutating any shared principal/SecY state, so a rejected DIST_SAK can
+	 * never disturb the current controlled-port owner.
+	 *
+	 * Recompute the election locally for THIS CA (side-effect free), using
+	 * only this CA's own live peers and the key-server priorities they
+	 * actually advertised. That makes the check self-contained and correct
+	 * on any CA:
+	 *  - it works when this CA is not (yet) the principal - e.g. a follower's
+	 *    very first DIST_SAK, received while the principal pointer is still
+	 *    NULL and the shared kay->key_server_sci is therefore unset; and
+	 *  - it stays correct even if a peer advertises a different key-server
+	 *    priority on its two CKNs. Key Server Priority is a per-participant
+	 *    field in every MKPDU's Basic Parameter Set (802.1X-2010 Cl. 9.5),
+	 *    not a port-scoped attribute, so although we never configure the two
+	 *    CKNs to differ (and vendors typically don't either), a conformant
+	 *    peer legitimately could, and election could then resolve to a
+	 *    different key server per CKN.
+	 *
+	 * The previous principal-only shortcut compared the shared
+	 * kay->key_server_sci (written by whichever CA is principal), which
+	 * silently assumed cross-CKN consistency; the per-CA recompute drops that
+	 * assumption. Converging the controlled port when two distinct key
+	 * servers distribute at once remains out of scope (see the takeover note
+	 * below), but per-frame validation is always correct. */
+	if (!ieee802_1x_kay_peer_is_elected_key_server(participant, peer)) {
 		wpa_printf(MSG_ERROR, "KaY: The key server is not elected");
 		return -1;
 	}
@@ -2622,8 +2636,13 @@ static int compare_priorities(const struct ieee802_1x_kay_peer *peer,
  * Returns true iff @cand is the key server this participant would elect for its
  * CA: it is the highest-priority (lowest key_server_priority, then lowest SCI)
  * key-server-capable live peer, and the local actor does not outrank or tie it.
- * Used to validate a received DIST_SAK before any shared principal/SecY state
- * is mutated, so a rejected message never disturbs the controlled-port owner.
+ * This is the sole validator for a received DIST_SAK: it runs before any shared
+ * principal/SecY state is mutated, so a rejected message never disturbs the
+ * controlled-port owner. It is self-contained - it uses only this CA's own live
+ * peers and their advertised key-server priorities - so it is correct on any CA
+ * (principal or not) and even if a peer advertises a different key-server
+ * priority on its two CKNs (Key Server Priority is a per-participant field the
+ * protocol permits to differ, though we never configure it that way).
  */
 static bool
 ieee802_1x_kay_peer_is_elected_key_server(
