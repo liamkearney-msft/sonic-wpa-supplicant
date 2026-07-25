@@ -3186,21 +3186,34 @@ static void ieee802_1x_participant_timer(void *eloop_ctx, void *timeout_ctx)
 	}
 
 	if (lp_changed) {
+		if (!dl_list_empty(&participant->live_peers))
+			ieee802_1x_kay_elect_key_server(participant);
+
+		/* Reconcile BEFORE quiescing a now-peerless CA. When this CA
+		 * lost its last live peer while owning the controlled port,
+		 * reconcile_principal() fails the port over to a live fallback
+		 * and migrate_principal_sas() re-homes the in-use SAK *and* its
+		 * SAK-Use state (to_use_sak) onto the new principal, so the
+		 * still-installed SAK keeps being advertised across the swap
+		 * (make-before-break). Clearing to_use_sak/is_key_server here
+		 * first would make the migration carry a stale "not using SAK"
+		 * state onto the new principal, dropping the SAK-Use body for
+		 * the live SAK and opening a datapath gap until the next rekey. */
+		ieee802_1x_kay_reconcile_principal(kay);
+
 		if (dl_list_empty(&participant->live_peers)) {
-			/* Lost last live peer: clear own advertised/SA state so a
-			 * dead standby stops advertising. reconcile_principal()
-			 * below decides teardown vs handoff. */
+			/* Now inert: stop advertising so a dead standby is quiet.
+			 * Any SAK-Use continuity has already been migrated to the
+			 * new principal (migrate_principal_sas() cleared our copy);
+			 * on teardown there is no new principal and clearing here
+			 * stops a peerless CA from advertising a retired SAK. */
 			participant->advised_desired = false;
 			participant->advised_capability =
 				MACSEC_CAP_NOT_IMPLEMENTED;
 			participant->to_use_sak = false;
 			participant->is_key_server = false;
 			participant->is_elected = false;
-		} else {
-			ieee802_1x_kay_elect_key_server(participant);
 		}
-
-		ieee802_1x_kay_reconcile_principal(kay);
 	}
 
 	dl_list_for_each_safe(peer, pre_peer, &participant->potential_peers,
