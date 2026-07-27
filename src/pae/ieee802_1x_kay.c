@@ -3058,6 +3058,41 @@ ieee802_1x_kay_decide_principal(struct ieee802_1x_kay *kay)
 
 
 /**
+ * ieee802_1x_kay_deferred_rekey - Fire the post-promotion key-material rekey
+ *
+ * A hitless principal promotion (failover, revertive fail-back, or CAK
+ * deletion) keeps running the migrated SAK so the data path never breaks. It
+ * must NOT force a fresh SAK mid-transition: distributing a brand-new SAK while
+ * both ends are still converging on the new principal is what drops frames. So
+ * the promotion arms this one-shot a few hello times out - by which point both
+ * ends have settled on the new principal - and only then requests a normal
+ * rekey under the new principal's CKN. That is an ordinary make-before-break
+ * rekey (peer installs the new RX SA before we advance TX), so it rotates key
+ * material off the departed CA with zero loss.
+ */
+static void ieee802_1x_kay_deferred_rekey(void *eloop_ctx, void *timeout_ctx)
+{
+	struct ieee802_1x_kay *kay = eloop_ctx;
+	struct ieee802_1x_mka_participant *principal;
+
+	principal = ieee802_1x_kay_get_principal_participant(kay);
+	if (!principal)
+		return;
+
+	/* Only the elected key server drives rekeying, and only while it still
+	 * owns the port with a live peer to rekey with. If any of that changed
+	 * since we armed (another swap, peer loss, teardown), drop it - whatever
+	 * changed it re-arms a fresh deferral when it needs one. */
+	if (!principal->is_key_server || dl_list_empty(&principal->live_peers))
+		return;
+
+	wpa_printf(MSG_DEBUG,
+		   "KaY: deferred post-promotion rekey under principal CKN");
+	principal->new_sak = true;
+}
+
+
+/**
  * ieee802_1x_kay_reconcile_principal - Act on the principal decision
  *
  * Recomputes the CP owner via decide_principal() then drives the shared CP/SecY
@@ -3081,8 +3116,31 @@ ieee802_1x_kay_reconcile_principal(struct ieee802_1x_kay *kay)
 		/* Decision: re-elect only when ownership actually moved, so the
 		 * new principal drives the CP and (if key server) arms a rekey
 		 * under its own CKN. Doing it every pass would re-arm each tick. */
-		if (want != prev)
+		if (want != prev) {
 			ieee802_1x_kay_elect_key_server(want);
+			/* Hitless promotion: decide_principal() migrated the
+			 * in-use SAK onto the new principal (want->to_use_sak),
+			 * so the data path is still up on the old key. The
+			 * immediate rekey elect_key_server() just armed would
+			 * distribute a fresh SAK while both ends are still
+			 * converging on the new principal - that mid-transition
+			 * cutover is what drops frames. Suppress it and defer a
+			 * few hello times, until both ends have settled; the
+			 * deferred rekey then rotates key material off the
+			 * departed CA cleanly (make-before-break, zero loss). A
+			 * cold initial claim carries no SAK, so it keeps its
+			 * immediate first SAK to bring the link up. */
+			if (prev && want->to_use_sak) {
+				want->new_sak = false;
+				eloop_cancel_timeout(
+					ieee802_1x_kay_deferred_rekey, kay,
+					NULL);
+				eloop_register_timeout(
+					(3 * kay->mka_hello_time) / 1000, 0,
+					ieee802_1x_kay_deferred_rekey, kay,
+					NULL);
+			}
+		}
 		ieee802_1x_kay_decide_macsec_use(want);
 		return;
 	}
@@ -3090,7 +3148,9 @@ ieee802_1x_kay_reconcile_principal(struct ieee802_1x_kay *kay)
 	if (!prev)
 		return;
 
-	/* No usable MKA remains; tear the data path down. */
+	/* No usable MKA remains; drop any deferred rekey and tear the data path
+	 * down. */
+	eloop_cancel_timeout(ieee802_1x_kay_deferred_rekey, kay, NULL);
 	wpa_printf(MSG_INFO,
 		   "KaY: No CA has a live peer; tearing down the controlled port");
 	kay->authenticated = false;
@@ -4226,6 +4286,8 @@ ieee802_1x_kay_deinit(struct ieee802_1x_kay *kay)
 		return;
 
 	wpa_printf(MSG_DEBUG, "KaY: state machine removed");
+
+	eloop_cancel_timeout(ieee802_1x_kay_deferred_rekey, kay, NULL);
 
 	while (!dl_list_empty(&kay->participant_list)) {
 		participant = dl_list_entry(kay->participant_list.next,
