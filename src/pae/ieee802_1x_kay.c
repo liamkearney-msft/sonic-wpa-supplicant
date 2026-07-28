@@ -3199,6 +3199,38 @@ ieee802_1x_kay_reconcile_principal(struct ieee802_1x_kay *kay)
 
 
 /**
+ * ieee802_1x_kay_peer_sci_live_on_sibling - is this SCI still a live peer of
+ * another participant (CA) on the same port?
+ *
+ * Used to distinguish an orchestrated fallback swap (the same physical peer is
+ * carried make-before-break by a sibling CA) from a genuine key-server loss.
+ * SCI is derived from the peer's MAC+port, so a match means the very same
+ * station is still live under another CKN on this port.
+ */
+static bool
+ieee802_1x_kay_peer_sci_live_on_sibling(struct ieee802_1x_kay *kay,
+					struct ieee802_1x_mka_participant *self,
+					const struct ieee802_1x_mka_sci *sci)
+{
+	struct ieee802_1x_mka_participant *p;
+	struct ieee802_1x_kay_peer *peer;
+
+	dl_list_for_each(p, &kay->participant_list,
+			 struct ieee802_1x_mka_participant, list) {
+		if (p == self)
+			continue;
+		dl_list_for_each(peer, &p->live_peers,
+				 struct ieee802_1x_kay_peer, list) {
+			if (sci_equal(&peer->sci, sci))
+				return true;
+		}
+	}
+
+	return false;
+}
+
+
+/**
  * ieee802_1x_participant_timer -
  */
 static void ieee802_1x_participant_timer(void *eloop_ctx, void *timeout_ctx)
@@ -3209,6 +3241,8 @@ static void ieee802_1x_participant_timer(void *eloop_ctx, void *timeout_ctx)
 	time_t now = time(NULL);
 	bool lp_changed;
 	bool key_server_removed;
+	struct ieee802_1x_mka_sci ks_removed_sci;
+	bool ks_removed_sci_valid = false;
 
 	participant = (struct ieee802_1x_mka_participant *)eloop_ctx;
 	kay = participant->kay;
@@ -3240,6 +3274,11 @@ static void ieee802_1x_participant_timer(void *eloop_ctx, void *timeout_ctx)
 				    sizeof(peer->mi));
 			wpa_printf(MSG_DEBUG, "\tMN: %d", peer->mn);
 			ieee802_1x_kay_deref_receive_sc(kay, &peer->sci);
+			if (peer->is_key_server) {
+				os_memcpy(&ks_removed_sci, &peer->sci,
+					  sizeof(ks_removed_sci));
+				ks_removed_sci_valid = true;
+			}
 			key_server_removed |= peer->is_key_server;
 			dl_list_del(&peer->list);
 			os_free(peer);
@@ -3262,7 +3301,29 @@ static void ieee802_1x_participant_timer(void *eloop_ctx, void *timeout_ctx)
 	 * MKA session.
 	 */
 	if (key_server_removed) {
-		if (!reset_participant_mi(participant)) {
+		/*
+		 * The MI reset above exists only to coax the key server into
+		 * re-dispatching a SAK: after it delists us on an ingress delay
+		 * our egress keeps flowing, so the key server never drops us
+		 * from its own peer list and would not start a fresh round.
+		 *
+		 * During a fallback-CAK swap that reason does not hold. A
+		 * sibling CA carries the port make-before-break
+		 * (migrate_principal_sas() re-homes the installed SAK), so no
+		 * re-dispatch is needed. Worse, resetting our MI here makes the
+		 * key server briefly hold our old and new MI as two live peers
+		 * for one SCI; its DIST-SAK zeroes sak_used for both, the stale
+		 * old-MI peer never re-reports, and its all_receiving gate
+		 * starves until a lossy transmit_when failsafe fires. So when
+		 * the very same station we just lost is still a live peer of a
+		 * sibling CA on this port, re-establish under the same MI.
+		 */
+		if (ks_removed_sci_valid &&
+		    ieee802_1x_kay_peer_sci_live_on_sibling(kay, participant,
+							    &ks_removed_sci)) {
+			wpa_printf(MSG_DEBUG,
+				   "KaY: Key server peer expired but same SCI is live on a sibling CA - re-establishing under same MI (no reset)");
+		} else if (!reset_participant_mi(participant)) {
 			wpa_printf(MSG_WARNING, "KaY: Could not update mi");
 		} else {
 			wpa_printf(MSG_DEBUG, "KaY: Update mi");
@@ -3891,6 +3952,7 @@ static int ieee802_1x_kay_decode_mkpdu(struct ieee802_1x_kay *kay,
 	struct ieee802_1x_mka_participant *participant;
 	struct ieee802_1x_mka_hdr *hdr;
 	struct ieee802_1x_kay_peer *peer;
+	struct ieee802_1x_kay_peer *pre_peer;
 	size_t body_len;
 	size_t left_len;
 	u8 body_type;
@@ -3945,6 +4007,38 @@ static int ieee802_1x_kay_decode_mkpdu(struct ieee802_1x_kay *kay,
 				   be_to_host32(participant->
 						current_peer_id.mn))) {
 				return -1;
+		}
+
+		/* A peer's SCI is derived from its MAC address and port
+		 * number, so distinct stations always have distinct SCIs, and
+		 * this participant's live_peers list only holds peers within
+		 * this one CA. Two live_peers entries that share an SCI can
+		 * therefore only be the same physical peer under two MIs: an
+		 * MKA participant uses exactly one MI at a time, so when a peer
+		 * resets its MI (e.g. during a SAK rotation) the previous MI's
+		 * entry is dead and lingers only until MKA_LIFE_TIME. As key
+		 * server that stale entry starves all_receiving (its sak_used
+		 * is cleared on SAK distribution and never re-reported),
+		 * forcing the transmit_when failsafe and a make-before-break
+		 * gap. Now that the current MI is live, evict any same-SCI live
+		 * peer carrying a different MI. Out-of-order stale MKPDUs are
+		 * already rejected by MN replay protection in the basic body. */
+		dl_list_for_each_safe(peer, pre_peer, &participant->live_peers,
+				      struct ieee802_1x_kay_peer, list) {
+			if (os_memcmp(peer->mi,
+				      participant->current_peer_id.mi,
+				      MI_LEN) == 0)
+				continue;
+			if (!sci_equal(&peer->sci,
+				       &participant->current_peer_sci))
+				continue;
+			wpa_printf(MSG_DEBUG,
+				   "KaY: Evict stale same-SCI live peer superseded by new MI");
+			wpa_hexdump(MSG_DEBUG, "\tMI: ", peer->mi,
+				    sizeof(peer->mi));
+			ieee802_1x_kay_deref_receive_sc(kay, &peer->sci);
+			dl_list_del(&peer->list);
+			os_free(peer);
 		}
 
 		ieee802_1x_kay_elect_key_server(participant);
