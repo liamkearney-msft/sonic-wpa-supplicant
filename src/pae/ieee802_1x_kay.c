@@ -1658,6 +1658,11 @@ ieee802_1x_mka_decode_sak_use_body(
 	if (!sa_key) {
 		wpa_printf(MSG_INFO,
 			   "KaY: We don't have a latest distributed key - ignore SAK use");
+		wpa_printf(MSG_DEBUG,
+			   "KaY: DIAG no-latest-key is_principal=%d is_key_server=%d",
+			   ieee802_1x_kay_is_principal_participant(kay,
+					participant),
+			   participant->is_key_server);
 		return 0;
 	}
 
@@ -1685,6 +1690,11 @@ ieee802_1x_mka_decode_sak_use_body(
 	if (!is_ki_equal(&sa_key->key_identifier, &ki)) {
 		wpa_printf(MSG_INFO,
 			   "KaY: Distributed keys don't match - ignore SAK use");
+		wpa_printf(MSG_DEBUG,
+			   "KaY: DIAG keys-dont-match is_principal=%d is_key_server=%d lrx=%d",
+			   ieee802_1x_kay_is_principal_participant(kay,
+					participant),
+			   participant->is_key_server, body->lrx);
 		return 0;
 	}
 	if (kay->mka_version == MKA_VERSION_1 && kay->pn_exhaustion == PENDING_XPN_EXHAUSTION) {
@@ -1729,28 +1739,67 @@ ieee802_1x_mka_decode_sak_use_body(
 	 */
 	if (participant->is_key_server) {
 		struct ieee802_1x_kay_peer *peer_iter;
+		struct ieee802_1x_kay_peer *blocker = NULL;
 		bool all_receiving = true;
+		int n_live = 0;
 
 		/* Distributed keys are equal from above comparison. */
 		peer->sak_used = true;
 
 		dl_list_for_each(peer_iter, &participant->live_peers,
 				 struct ieee802_1x_kay_peer, list) {
+			n_live++;
 			if (!peer_iter->sak_used) {
 				all_receiving = false;
-				break;
+				if (!blocker)
+					blocker = peer_iter;
 			}
 		}
+		/* DIAG(H3): attribute the key-server all_receiving verdict to a
+		 * CKN (is_principal) so a non-principal shadow/fallback CA that
+		 * is driving the shared CP becomes visible, and name the peer
+		 * whose missing SAK-Use is starving the gate. Log-only. */
 		if (all_receiving) {
+			wpa_printf(MSG_DEBUG,
+				   "KaY: DIAG all_receiving LATCHED is_principal=%d live_peers=%d",
+				   ieee802_1x_kay_is_principal_participant(kay,
+						participant),
+				   n_live);
 			participant->to_dist_sak = false;
 			ieee802_1x_cp_set_allreceiving(kay->cp, true);
 			ieee802_1x_cp_sm_step(kay->cp);
+		} else {
+			wpa_printf(MSG_DEBUG,
+				   "KaY: DIAG all_receiving BLOCKED is_principal=%d live_peers=%d",
+				   ieee802_1x_kay_is_principal_participant(kay,
+						participant),
+				   n_live);
+			wpa_printf(MSG_DEBUG, "KaY: DIAG   reporter MI=%s",
+				   mi_txt(peer->mi));
+			if (blocker)
+				wpa_printf(MSG_DEBUG,
+					   "KaY: DIAG   blocker  MI=%s",
+					   mi_txt(blocker->mi));
 		}
 	} else if (peer->is_key_server) {
+		/* DIAG(H3): follower branch - which CA (is_principal?) drives
+		 * server_transmitting onto the shared CP, and the ltx it saw. */
+		wpa_printf(MSG_DEBUG,
+			   "KaY: DIAG follower SAK-USE is_principal=%d ltx=%d",
+			   ieee802_1x_kay_is_principal_participant(kay,
+					participant),
+			   body->ltx);
+		wpa_printf(MSG_DEBUG, "KaY: DIAG   key-server peer MI=%s",
+			   mi_txt(peer->mi));
 		if (body->ltx) {
 			ieee802_1x_cp_set_servertransmitting(kay->cp, true);
 			ieee802_1x_cp_sm_step(kay->cp);
 		}
+	} else {
+		wpa_printf(MSG_DEBUG,
+			   "KaY: DIAG SAK-USE drives no CP transition is_principal=%d (participant is_key_server=0, peer is_key_server=0)",
+			   ieee802_1x_kay_is_principal_participant(kay,
+					participant));
 	}
 
 	/* If I'm key server, and detects peer member PN exhaustion, rekey.
