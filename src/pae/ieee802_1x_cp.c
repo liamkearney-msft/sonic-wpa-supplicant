@@ -392,6 +392,19 @@ SM_STEP(CP)
 		break;
 
 	case CP_RECEIVING:
+		/* DIAG(H3): the KaY all_receiving latch calls set_allreceiving()
+		 * +sm_step, but on the in-place CA-swap path the KS CP was
+		 * observed to advance on the 6 s transmit_when failsafe rather
+		 * than on the latch (ab03a23ef coalesce produced zero delta
+		 * here). Log every RECEIVING evaluation with the deciding flags
+		 * so we can tell which guard blocks the TRANSMIT edge - a lost
+		 * latch (all_receiving=0 at eval), an elected_self flap, or
+		 * changed_connect churn. Log-only. */
+		wpa_printf(MSG_DEBUG,
+			   "CP: DIAG RECEIVING-eval elected_self=%d all_receiving=%d transmit_when=%d new_sak=%d changed_connect=%d ctrl_port=%d",
+			   sm->elected_self, sm->all_receiving, sm->transmit_when,
+			   sm->new_sak, changed_connect(sm),
+			   sm->controlled_port_enabled);
 		if (sm->new_sak || changed_connect(sm))
 			SM_ENTER(CP, ABANDON);
 		else if (!sm->elected_self)
@@ -420,6 +433,15 @@ SM_STEP(CP)
 		break;
 
 	case CP_READY:
+		/* DIAG(H3): if the KS ever detours to READY (elected_self was
+		 * false at the post-latch step) it can only advance on
+		 * server_transmitting, which a key server never receives - it
+		 * would stall here until a rekey. Log the READY guards to catch
+		 * that path. Log-only. */
+		wpa_printf(MSG_DEBUG,
+			   "CP: DIAG READY-eval server_transmitting=%d ctrl_port=%d new_sak=%d changed_connect=%d",
+			   sm->server_transmitting, sm->controlled_port_enabled,
+			   sm->new_sak, changed_connect(sm));
 		if (sm->new_sak || changed_connect(sm))
 			SM_ENTER(CP, ABANDON);
 		else if (sm->server_transmitting || !sm->controlled_port_enabled)
@@ -514,6 +536,14 @@ static void ieee802_1x_cp_step_cb(void *eloop_ctx, void *timeout_ctx)
 {
 	struct ieee802_1x_cp_sm *sm = eloop_ctx;
 	sm->step_pending = false;
+	/* DIAG(H3): confirms the deferred (0 s eloop) step actually fires and
+	 * what it sees. If the KaY latch's sm_step never reaches here before
+	 * the transmit_when failsafe (or reaches here with all_receiving=0),
+	 * the latch is being lost rather than merely mis-scheduled. Log-only. */
+	wpa_printf(MSG_DEBUG,
+		   "CP: DIAG deferred step_cb run CP_state=%d all_receiving=%d elected_self=%d transmit_when=%d",
+		   sm->CP_state, sm->all_receiving, sm->elected_self,
+		   sm->transmit_when);
 	ieee802_1x_cp_step_run(sm);
 }
 
@@ -719,6 +749,15 @@ void ieee802_1x_cp_sm_step(void *cp_ctx)
 	 */
 	struct ieee802_1x_cp_sm *sm = cp_ctx;
 
+	/* DIAG(H3): log every sm_step call and whether it armed a fresh
+	 * deferred step or coalesced onto an already-pending one. Pairing
+	 * this with the KaY "all_receiving LATCHED" line and the step_cb DIAG
+	 * shows, on the in-place path, whether the latch's step is armed,
+	 * coalesced, or delivered before the transmit_when failsafe. Log-only. */
+	wpa_printf(MSG_DEBUG,
+		   "CP: DIAG sm_step call CP_state=%d step_pending=%d all_receiving=%d elected_self=%d transmit_when=%d",
+		   sm->CP_state, sm->step_pending, sm->all_receiving,
+		   sm->elected_self, sm->transmit_when);
 	if (sm->step_pending)
 		return;
 	sm->step_pending = true;
@@ -740,5 +779,12 @@ ieee802_1x_cp_transmit_when_timeout(void *eloop_ctx, void *timeout_ctx)
 {
 	struct ieee802_1x_cp_sm *sm = eloop_ctx;
 	sm->transmit_when = 0;
+	/* DIAG(H3): mark the failsafe firing so the syslog distinguishes a
+	 * transmit_when-driven advance from an all_receiving-latch-driven one.
+	 * On the in-place path this is expected to be what advances the CP;
+	 * the fix must move the advance to the latch instead. Log-only. */
+	wpa_printf(MSG_DEBUG,
+		   "CP: DIAG transmit_when failsafe fired CP_state=%d all_receiving=%d elected_self=%d",
+		   sm->CP_state, sm->all_receiving, sm->elected_self);
 	ieee802_1x_cp_step_run(sm);
 }
