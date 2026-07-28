@@ -380,6 +380,9 @@ ieee802_1x_kay_migrate_principal_sas(
 	struct ieee802_1x_mka_participant *old,
 	struct ieee802_1x_mka_participant *new_principal);
 
+static void ieee802_1x_kay_deferred_rekey(void *eloop_ctx, void *timeout_ctx);
+static void ieee802_1x_kay_arm_deferred_rekey(struct ieee802_1x_kay *kay);
+
 static void
 ieee802_1x_kay_set_principal_participant(
 	struct ieee802_1x_kay *kay,
@@ -2718,7 +2721,22 @@ ieee802_1x_kay_elect_key_server(struct ieee802_1x_mka_participant *participant)
 			ieee802_1x_cp_sm_step(kay->cp);
 		}
 
-		participant->new_sak = true;
+		/* Rekey policy (central point for every caller): only rekey
+		 * inline when there is no live SAK yet - a cold bring-up needs
+		 * its first SAK now to raise the link. When a SAK is already
+		 * installed (steady state, or a hitless promotion that migrated
+		 * the in-use SAK), distributing a fresh SAK inline races the
+		 * datapath while both ends are still converging on this key
+		 * server - that mid-transition cutover is what drops frames.
+		 * Defer it a few hello times and coalesce: back-to-back
+		 * ownership swaps and the live-peer churn that follows each
+		 * re-arm the one-shot, so exactly ONE rekey fires once the
+		 * principal has been stable, rotating key material off the
+		 * departed CA make-before-break with zero loss. */
+		if (participant->to_use_sak)
+			ieee802_1x_kay_arm_deferred_rekey(kay);
+		else
+			participant->new_sak = true;
 		wpa_printf(MSG_DEBUG, "KaY: I am elected as key server");
 
 		os_memcpy(&kay->key_server_sci, &kay->actor_sci,
@@ -3093,6 +3111,24 @@ static void ieee802_1x_kay_deferred_rekey(void *eloop_ctx, void *timeout_ctx)
 
 
 /**
+ * ieee802_1x_kay_arm_deferred_rekey - (Re)arm the coalesced post-promotion rekey
+ *
+ * Cancels any pending deferral and schedules a single one-shot a few hello
+ * times out. Called on every key-server election that already carries a live
+ * SAK (promotion swap or live-peer churn). Because each call cancels the prior
+ * timer and re-arms, a burst of back-to-back swaps and the peer churn that
+ * follows collapses into exactly ONE rekey, fired only once the principal has
+ * been stable (no further election) for the whole window.
+ */
+static void ieee802_1x_kay_arm_deferred_rekey(struct ieee802_1x_kay *kay)
+{
+	eloop_cancel_timeout(ieee802_1x_kay_deferred_rekey, kay, NULL);
+	eloop_register_timeout((3 * kay->mka_hello_time) / 1000, 0,
+			       ieee802_1x_kay_deferred_rekey, kay, NULL);
+}
+
+
+/**
  * ieee802_1x_kay_reconcile_principal - Act on the principal decision
  *
  * Recomputes the CP owner via decide_principal() then drives the shared CP/SecY
@@ -3114,33 +3150,13 @@ ieee802_1x_kay_reconcile_principal(struct ieee802_1x_kay *kay)
 
 	if (want) {
 		/* Decision: re-elect only when ownership actually moved, so the
-		 * new principal drives the CP and (if key server) arms a rekey
-		 * under its own CKN. Doing it every pass would re-arm each tick. */
-		if (want != prev) {
+		 * new principal drives the CP and (if key server) arms its rekey
+		 * under its own CKN. Doing it every pass would re-arm each tick.
+		 * elect_key_server() centralizes the rekey policy: a promotion
+		 * that carries a migrated in-use SAK defers+coalesces the rekey,
+		 * so the mid-transition cutover that drops frames never fires. */
+		if (want != prev)
 			ieee802_1x_kay_elect_key_server(want);
-			/* Hitless promotion: decide_principal() migrated the
-			 * in-use SAK onto the new principal (want->to_use_sak),
-			 * so the data path is still up on the old key. The
-			 * immediate rekey elect_key_server() just armed would
-			 * distribute a fresh SAK while both ends are still
-			 * converging on the new principal - that mid-transition
-			 * cutover is what drops frames. Suppress it and defer a
-			 * few hello times, until both ends have settled; the
-			 * deferred rekey then rotates key material off the
-			 * departed CA cleanly (make-before-break, zero loss). A
-			 * cold initial claim carries no SAK, so it keeps its
-			 * immediate first SAK to bring the link up. */
-			if (prev && want->to_use_sak) {
-				want->new_sak = false;
-				eloop_cancel_timeout(
-					ieee802_1x_kay_deferred_rekey, kay,
-					NULL);
-				eloop_register_timeout(
-					(3 * kay->mka_hello_time) / 1000, 0,
-					ieee802_1x_kay_deferred_rekey, kay,
-					NULL);
-			}
-		}
 		ieee802_1x_kay_decide_macsec_use(want);
 		return;
 	}
