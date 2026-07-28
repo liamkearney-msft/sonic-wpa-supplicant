@@ -2730,9 +2730,10 @@ ieee802_1x_kay_elect_key_server(struct ieee802_1x_mka_participant *participant)
 		 * server - that mid-transition cutover is what drops frames.
 		 * Defer it a few hello times and coalesce: back-to-back
 		 * ownership swaps and the live-peer churn that follows each
-		 * re-arm the one-shot, so exactly ONE rekey fires once the
-		 * principal has been stable, rotating key material off the
-		 * departed CA make-before-break with zero loss. */
+		 * fold into a single one-shot (bounded from the first arm, so
+		 * churn cannot starve it), so exactly ONE rekey fires shortly
+		 * after the burst, rotating key material off the departed CA
+		 * make-before-break with zero loss. */
 		if (participant->to_use_sak)
 			ieee802_1x_kay_arm_deferred_rekey(kay);
 		else
@@ -3111,18 +3112,25 @@ static void ieee802_1x_kay_deferred_rekey(void *eloop_ctx, void *timeout_ctx)
 
 
 /**
- * ieee802_1x_kay_arm_deferred_rekey - (Re)arm the coalesced post-promotion rekey
+ * ieee802_1x_kay_arm_deferred_rekey - Arm the coalesced post-promotion rekey
  *
- * Cancels any pending deferral and schedules a single one-shot a few hello
- * times out. Called on every key-server election that already carries a live
- * SAK (promotion swap or live-peer churn). Because each call cancels the prior
- * timer and re-arms, a burst of back-to-back swaps and the peer churn that
- * follows collapses into exactly ONE rekey, fired only once the principal has
- * been stable (no further election) for the whole window.
+ * Schedules a single one-shot a few hello times out. Called on every key-server
+ * election that already carries a live SAK (promotion swap or live-peer churn).
+ *
+ * Non-resetting on purpose: if a deferral is already pending we leave its fire
+ * time alone rather than pushing it out. That bounds the defer to ~3x hello
+ * from the FIRST arm, so (a) a burst of back-to-back swaps + the peer churn
+ * that follows still collapses into ONE rekey, but (b) a link that keeps
+ * flapping can never starve the rekey indefinitely, and a newly joined peer is
+ * always keyed within the window (generate_new_sak() distributes to every live
+ * peer). Swaps spaced further than the window apart simply each get their own
+ * clean rekey, which is the already-proven single-transition case.
  */
 static void ieee802_1x_kay_arm_deferred_rekey(struct ieee802_1x_kay *kay)
 {
-	eloop_cancel_timeout(ieee802_1x_kay_deferred_rekey, kay, NULL);
+	if (eloop_is_timeout_registered(ieee802_1x_kay_deferred_rekey, kay,
+					NULL))
+		return;
 	eloop_register_timeout((3 * kay->mka_hello_time) / 1000, 0,
 			       ieee802_1x_kay_deferred_rekey, kay, NULL);
 }
