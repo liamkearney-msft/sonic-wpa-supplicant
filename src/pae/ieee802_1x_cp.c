@@ -79,6 +79,7 @@ struct ieee802_1x_cp_sm {
 	u32 transmit_delay;
 	u32 retire_when;
 	u32 retire_delay;
+	bool step_pending; /* a deferred step_cb is already queued */
 
 	/* not defined IEEE Std 802.1X-2010 */
 	struct ieee802_1x_kay *kay;
@@ -512,6 +513,7 @@ static void ieee802_1x_cp_step_run(struct ieee802_1x_cp_sm *sm)
 static void ieee802_1x_cp_step_cb(void *eloop_ctx, void *timeout_ctx)
 {
 	struct ieee802_1x_cp_sm *sm = eloop_ctx;
+	sm->step_pending = false;
 	ieee802_1x_cp_step_run(sm);
 }
 
@@ -703,9 +705,23 @@ void ieee802_1x_cp_sm_step(void *cp_ctx)
 	 * Run ieee802_1x_cp_step_run from a registered timeout
 	 * to make sure that other possible timeouts/events are processed
 	 * and to avoid long function call chains.
+	 *
+	 * Coalesce onto an already-queued step instead of cancelling and
+	 * re-registering it: a single deferred step_run converges the SM
+	 * (it loops until CP_state is stable), so one pending callback covers
+	 * all changes accumulated until it runs. Re-arming on every call let a
+	 * burst of sm_step() invocations (e.g. multi-participant MKPDU decode,
+	 * election and reconcile during a principal cutover) perpetually push
+	 * the 0 s timeout back so eloop - which services one timeout per loop
+	 * iteration - never reached it before the transmit_when failsafe. That
+	 * starved an already-latched all_receiving of a step, stalling the
+	 * RECEIVING->TRANSMIT edge until the ~6 s failsafe.
 	 */
 	struct ieee802_1x_cp_sm *sm = cp_ctx;
-	eloop_cancel_timeout(ieee802_1x_cp_step_cb, sm, NULL);
+
+	if (sm->step_pending)
+		return;
+	sm->step_pending = true;
 	eloop_register_timeout(0, 0, ieee802_1x_cp_step_cb, sm, NULL);
 }
 
