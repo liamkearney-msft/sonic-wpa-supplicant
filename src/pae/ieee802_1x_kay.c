@@ -1755,8 +1755,16 @@ ieee802_1x_mka_decode_sak_use_body(
 		}
 		if (all_receiving) {
 			participant->to_dist_sak = false;
-			ieee802_1x_cp_set_allreceiving(kay->cp, true);
-			ieee802_1x_cp_sm_step(kay->cp);
+			/* Invariant: only the principal drives the shared CP.
+			 * A non-principal (e.g. a fallback CA) may legitimately
+			 * be key server of its own CA and reach here, but must
+			 * not step the shared CP - elect_key_server and
+			 * decide_macsec_use gate the same way. */
+			if (ieee802_1x_kay_is_principal_participant(kay,
+								   participant)) {
+				ieee802_1x_cp_set_allreceiving(kay->cp, true);
+				ieee802_1x_cp_sm_step(kay->cp);
+			}
 		}
 
 		/* Retire gate (mirror of the all_receiving forward gate):
@@ -1767,7 +1775,11 @@ ieee802_1x_mka_decode_sak_use_body(
 		if (all_transmitting)
 			ieee802_1x_cp_sm_step(kay->cp);
 	} else if (peer->is_key_server) {
-		if (body->ltx) {
+		/* Only the principal drives the shared CP; a non-principal
+		 * participant that merely has a key-server peer must not step
+		 * the shared CP on its behalf. */
+		if (body->ltx &&
+		    ieee802_1x_kay_is_principal_participant(kay, participant)) {
 			ieee802_1x_cp_set_servertransmitting(kay->cp, true);
 			ieee802_1x_cp_sm_step(kay->cp);
 		}
