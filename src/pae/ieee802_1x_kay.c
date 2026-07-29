@@ -788,6 +788,7 @@ ieee802_1x_kay_create_peer(const u8 *mi, u32 mn)
 	peer->mn = mn;
 	peer->expire = time(NULL) + MKA_LIFE_TIME / 1000;
 	peer->sak_used = false;
+	peer->sak_txed = false;
 	peer->missing_sak_use_count = 0;
 
 	return peer;
@@ -1730,22 +1731,41 @@ ieee802_1x_mka_decode_sak_use_body(
 	if (participant->is_key_server) {
 		struct ieee802_1x_kay_peer *peer_iter;
 		bool all_receiving = true;
+		bool all_transmitting = true;
 
 		/* Distributed keys are equal from above comparison. */
 		peer->sak_used = true;
+		/* The peer is transmitting on our latest key once it advertises
+		 * latest-key tx (body->ltx) for a latest key that matches ours
+		 * (body->lrx, matched above). This gates old-SA retirement so we
+		 * never delete the old RX SA while a peer still transmits on it.
+		 */
+		peer->sak_txed = body->lrx && body->ltx;
 
 		dl_list_for_each(peer_iter, &participant->live_peers,
 				 struct ieee802_1x_kay_peer, list) {
-			if (!peer_iter->sak_used) {
+			/* Evaluate every live peer (no early break): the retire
+			 * gate needs all_transmitting computed across the whole
+			 * live set, not just up to the first non-receiving peer.
+			 */
+			if (!peer_iter->sak_used)
 				all_receiving = false;
-				break;
-			}
+			if (!peer_iter->sak_txed)
+				all_transmitting = false;
 		}
 		if (all_receiving) {
 			participant->to_dist_sak = false;
 			ieee802_1x_cp_set_allreceiving(kay->cp, true);
 			ieee802_1x_cp_sm_step(kay->cp);
 		}
+
+		/* Retire gate (mirror of the all_receiving forward gate):
+		 * release the old SA as soon as every live peer confirms it has
+		 * advanced its transmit to the latest SAK, instead of waiting on
+		 * the failsafe timer. */
+		ieee802_1x_cp_set_all_transmitting(kay->cp, all_transmitting);
+		if (all_transmitting)
+			ieee802_1x_cp_sm_step(kay->cp);
 	} else if (peer->is_key_server) {
 		if (body->ltx) {
 			ieee802_1x_cp_set_servertransmitting(kay->cp, true);
@@ -2558,8 +2578,10 @@ ieee802_1x_kay_generate_new_sak(struct ieee802_1x_mka_participant *participant)
 	ieee802_1x_cp_sm_step(kay->cp);
 
 	dl_list_for_each(peer, &participant->live_peers,
-			 struct ieee802_1x_kay_peer, list)
+			 struct ieee802_1x_kay_peer, list) {
 		peer->sak_used = false;
+		peer->sak_txed = false;
+	}
 
 	kay->dist_kn++;
 	kay->dist_an++;
