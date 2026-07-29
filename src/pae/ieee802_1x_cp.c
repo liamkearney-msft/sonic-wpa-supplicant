@@ -47,6 +47,7 @@ struct ieee802_1x_cp_sm {
 	u8 distributed_an;
 	bool using_receive_sas;
 	bool all_receiving;
+	bool all_transmitting;
 	bool server_transmitting;
 	bool using_transmit_sa;
 
@@ -244,6 +245,7 @@ SM_STATE(CP, RECEIVE)
 	ieee802_1x_kay_enable_rx_sas(sm->kay, sm->lki);
 	sm->new_sak = false;
 	sm->all_receiving = false;
+	sm->all_transmitting = false;
 }
 
 
@@ -286,6 +288,7 @@ SM_STATE(CP, TRANSMIT)
 					  sm->ltx, sm->lrx);
 	ieee802_1x_kay_enable_tx_sas(sm->kay,  sm->lki);
 	sm->all_receiving = false;
+	sm->all_transmitting = false;
 	sm->server_transmitting = false;
 }
 
@@ -421,7 +424,13 @@ SM_STEP(CP)
 		break;
 
 	case CP_TRANSMITTING:
-		if (!sm->retire_when || changed_connect(sm))
+		/* Retire the old SA once every live peer has advanced its
+		 * transmit to the latest SAK (all_transmitting, latched by the
+		 * key server from peer SAK-Use). retire_when is only a generous
+		 * failsafe now, so a slow peer's still-in-use old RX SA is not
+		 * torn down before it stops transmitting on it. */
+		if (sm->all_transmitting || !sm->retire_when ||
+		    changed_connect(sm))
 			SM_ENTER(CP, RETIRE);
 		break;
 
@@ -498,7 +507,7 @@ struct ieee802_1x_cp_sm * ieee802_1x_cp_sm_init(struct ieee802_1x_kay *kay)
 	sm->cipher_offset = kay->macsec_confidentiality;
 	sm->confidentiality_offset = sm->cipher_offset;
 	sm->transmit_delay = MKA_LIFE_TIME;
-	sm->retire_delay = MKA_SAK_RETIRE_TIME;
+	sm->retire_delay = MKA_SAK_RETIRE_FAILSAFE_TIME;
 	sm->CP_state = CP_BEGIN;
 	sm->changed = false;
 
@@ -699,6 +708,16 @@ void ieee802_1x_cp_set_allreceiving(void *cp_ctx, bool status)
 {
 	struct ieee802_1x_cp_sm *sm = cp_ctx;
 	sm->all_receiving = status;
+}
+
+
+/**
+ * ieee802_1x_cp_set_all_transmitting -
+ */
+void ieee802_1x_cp_set_all_transmitting(void *cp_ctx, bool status)
+{
+	struct ieee802_1x_cp_sm *sm = cp_ctx;
+	sm->all_transmitting = status;
 }
 
 
