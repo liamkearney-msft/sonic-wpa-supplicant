@@ -296,7 +296,14 @@ SM_STATE(CP, TRANSMIT)
 SM_STATE(CP, TRANSMITTING)
 {
 	SM_ENTRY(CP, TRANSMITTING);
-	sm->retire_when = sm->orx ? sm->retire_delay : 0;
+	/* The key server holds the old SA until every live peer has advanced
+	 * its transmit to the new SAK (the all_transmitting gate in SM_STEP);
+	 * retire_when is only a long failsafe for a peer that stays live but
+	 * never confirms. A follower cannot observe all_transmitting, so it
+	 * keeps the stock short retire timer and is unaffected. */
+	sm->retire_when = sm->orx ?
+		(sm->elected_self ? MKA_SAK_RETIRE_FAILSAFE_TIME :
+		 sm->retire_delay) : 0;
 	sm->otx = false;
 	ieee802_1x_kay_set_old_sa_attr(sm->kay, sm->oki, sm->oan,
 				       sm->otx, sm->orx);
@@ -507,7 +514,7 @@ struct ieee802_1x_cp_sm * ieee802_1x_cp_sm_init(struct ieee802_1x_kay *kay)
 	sm->cipher_offset = kay->macsec_confidentiality;
 	sm->confidentiality_offset = sm->cipher_offset;
 	sm->transmit_delay = MKA_LIFE_TIME;
-	sm->retire_delay = MKA_SAK_RETIRE_FAILSAFE_TIME;
+	sm->retire_delay = MKA_SAK_RETIRE_TIME;
 	sm->CP_state = CP_BEGIN;
 	sm->changed = false;
 
