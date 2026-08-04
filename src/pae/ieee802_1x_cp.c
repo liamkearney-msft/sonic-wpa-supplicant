@@ -747,8 +747,11 @@ void ieee802_1x_cp_sm_step(void *cp_ctx)
 
 	if (sm->step_pending)
 		return;
-	sm->step_pending = true;
-	eloop_register_timeout(0, 0, ieee802_1x_cp_step_cb, sm, NULL);
+	/* Latch only after the timeout is actually queued. If registration
+	 * fails, leaving step_pending clear lets the next sm_step() retry
+	 * rather than wedging the CP state machine permanently. */
+	if (eloop_register_timeout(0, 0, ieee802_1x_cp_step_cb, sm, NULL) == 0)
+		sm->step_pending = true;
 }
 
 

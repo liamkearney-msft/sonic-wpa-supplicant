@@ -262,6 +262,14 @@ struct ieee802_1x_kay {
 	 * atomically when a fallback CKN takes over (SONiC fallback-CAK). */
 	struct ieee802_1x_mka_participant *principal_participant;
 
+	/* Monotonic principal-ownership generation, bumped on every change of
+	 * principal_participant. A deferred post-promotion rekey records the
+	 * generation it was armed under; if ownership moves again before it
+	 * fires the generations differ, so it restarts the settle window under
+	 * the new principal instead of rekeying an unsettled CA. */
+	unsigned int principal_generation;
+	unsigned int deferred_rekey_generation;
+
 	/* The transmit SC and the receive SCs model the single SecY (one per
 	 * port), so they live on the KaY and are shared by every MKA
 	 * participant. The transmit SC always uses the actor SCI; each receive

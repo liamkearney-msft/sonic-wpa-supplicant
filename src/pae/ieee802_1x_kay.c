@@ -395,6 +395,7 @@ ieee802_1x_kay_set_principal_participant(
 					     participant);
 
 	kay->principal_participant = participant;
+	kay->principal_generation++;
 	if (participant) {
 		wpa_printf(MSG_DEBUG,
 			   "KaY: principal participant (CP owner) set to CKN %s",
@@ -2743,14 +2744,15 @@ ieee802_1x_kay_elect_key_server(struct ieee802_1x_mka_participant *participant)
 			ieee802_1x_cp_sm_step(kay->cp);
 		}
 
-		/* Rekey policy (central point for every caller): only rekey
-		 * inline when there is no live SAK yet - a cold bring-up needs
-		 * its first SAK now to raise the link. When a SAK is already
-		 * installed (steady state, or a hitless promotion that migrated
-		 * the in-use SAK), distributing a fresh SAK inline races the
-		 * datapath while both ends are still converging on this key
-		 * server - that mid-transition cutover is what drops frames.
-		 * Defer it a few hello times and coalesce: back-to-back
+		/* Rekey policy for the non-obliged key-server path (the obliged
+		 * single-participant path above rekeys inline and returns): only
+		 * rekey inline when there is no live SAK yet - a cold bring-up
+		 * needs its first SAK now to raise the link. When a SAK is
+		 * already installed (steady state, or a hitless promotion that
+		 * migrated the in-use SAK), distributing a fresh SAK inline
+		 * races the datapath while both ends are still converging on
+		 * this key server - that mid-transition cutover is what drops
+		 * frames. Defer it a few hello times and coalesce: back-to-back
 		 * ownership swaps and the live-peer churn that follows each
 		 * fold into a single one-shot (bounded from the first arm, so
 		 * churn cannot starve it), so exactly ONE rekey fires shortly
@@ -3127,6 +3129,18 @@ static void ieee802_1x_kay_deferred_rekey(void *eloop_ctx, void *timeout_ctx)
 	if (!principal->is_key_server || dl_list_empty(&principal->live_peers))
 		return;
 
+	/* Ownership moved since we armed: participant A promoted and armed
+	 * this, then B took over before it fired. Rekeying now would hit B's CA
+	 * before it has settled - the mid-transition cutover this defer exists
+	 * to avoid. Restart the settle window under the current principal; the
+	 * migrated SAK keeps the data path up meanwhile. Only genuine principal
+	 * changes reset the clock - plain live-peer churn keeps the generation,
+	 * so it still coalesces and stays bounded from the first arm. */
+	if (kay->principal_generation != kay->deferred_rekey_generation) {
+		ieee802_1x_kay_arm_deferred_rekey(kay);
+		return;
+	}
+
 	wpa_printf(MSG_DEBUG,
 		   "KaY: deferred post-promotion rekey under principal CKN");
 	principal->new_sak = true;
@@ -3141,18 +3155,20 @@ static void ieee802_1x_kay_deferred_rekey(void *eloop_ctx, void *timeout_ctx)
  *
  * Non-resetting on purpose: if a deferral is already pending we leave its fire
  * time alone rather than pushing it out. That bounds the defer to ~3x hello
- * from the FIRST arm, so (a) a burst of back-to-back swaps + the peer churn
- * that follows still collapses into ONE rekey, but (b) a link that keeps
- * flapping can never starve the rekey indefinitely, and a newly joined peer is
- * always keyed within the window (generate_new_sak() distributes to every live
- * peer). Swaps spaced further than the window apart simply each get their own
- * clean rekey, which is the already-proven single-transition case.
+ * from the FIRST arm, so a burst of back-to-back swaps + the peer churn that
+ * follows still collapses into ONE rekey. Plain live-peer churn keeps the
+ * principal generation, so it stays coalesced and bounded; only a genuine
+ * change of principal restarts the settle window (the deferred handler re-arms
+ * when it sees the generation moved), because each new owner needs its own
+ * settle time before we rekey its CA. A newly joined peer is always keyed
+ * within the window (generate_new_sak() distributes to every live peer).
  */
 static void ieee802_1x_kay_arm_deferred_rekey(struct ieee802_1x_kay *kay)
 {
 	if (eloop_is_timeout_registered(ieee802_1x_kay_deferred_rekey, kay,
 					NULL))
 		return;
+	kay->deferred_rekey_generation = kay->principal_generation;
 	eloop_register_timeout((3 * kay->mka_hello_time) / 1000, 0,
 			       ieee802_1x_kay_deferred_rekey, kay, NULL);
 }
@@ -3262,7 +3278,6 @@ static void ieee802_1x_participant_timer(void *eloop_ctx, void *timeout_ctx)
 	struct ieee802_1x_kay_peer *peer, *pre_peer;
 	time_t now = time(NULL);
 	bool lp_changed;
-	bool key_server_removed;
 	struct ieee802_1x_mka_sci ks_removed_sci;
 	bool ks_removed_sci_valid = false;
 
@@ -3287,7 +3302,6 @@ static void ieee802_1x_participant_timer(void *eloop_ctx, void *timeout_ctx)
 	}
 
 	lp_changed = false;
-	key_server_removed = false;
 	dl_list_for_each_safe(peer, pre_peer, &participant->live_peers,
 			      struct ieee802_1x_kay_peer, list) {
 		if (now > peer->expire) {
@@ -3301,7 +3315,6 @@ static void ieee802_1x_participant_timer(void *eloop_ctx, void *timeout_ctx)
 					  sizeof(ks_removed_sci));
 				ks_removed_sci_valid = true;
 			}
-			key_server_removed |= peer->is_key_server;
 			dl_list_del(&peer->list);
 			os_free(peer);
 			lp_changed = true;
@@ -3322,15 +3335,12 @@ static void ieee802_1x_participant_timer(void *eloop_ctx, void *timeout_ctx)
 	 * So we need to update mi to avoid the failure of the re-establishment
 	 * MKA session.
 	 */
-	if (key_server_removed) {
+	if (ks_removed_sci_valid) {
 		/*
-		 * The MI reset above exists only to coax the key server into
-		 * re-dispatching a SAK: after it delists us on an ingress delay
-		 * our egress keeps flowing, so the key server never drops us
-		 * from its own peer list and would not start a fresh round.
-		 *
-		 * During a fallback-CAK swap that reason does not hold. A
-		 * sibling CA carries the port make-before-break
+		 * The MI reset here exists only to coax the key server into
+		 * re-dispatching a SAK after an ingress delay delists it (see
+		 * the rationale above). During a fallback-CAK swap that reason
+		 * does not hold: a sibling CA carries the port make-before-break
 		 * (migrate_principal_sas() re-homes the installed SAK), so no
 		 * re-dispatch is needed. Worse, resetting our MI here makes the
 		 * key server briefly hold our old and new MI as two live peers
@@ -3340,8 +3350,7 @@ static void ieee802_1x_participant_timer(void *eloop_ctx, void *timeout_ctx)
 		 * the very same station we just lost is still a live peer of a
 		 * sibling CA on this port, re-establish under the same MI.
 		 */
-		if (ks_removed_sci_valid &&
-		    ieee802_1x_kay_peer_sci_live_on_sibling(kay, participant,
+		if (ieee802_1x_kay_peer_sci_live_on_sibling(kay, participant,
 							    &ks_removed_sci)) {
 			wpa_printf(MSG_DEBUG,
 				   "KaY: Key server peer expired but same SCI is live on a sibling CA - re-establishing under same MI (no reset)");
@@ -3410,6 +3419,16 @@ static void ieee802_1x_participant_timer(void *eloop_ctx, void *timeout_ctx)
 			if (!ieee802_1x_kay_generate_new_sak(participant)) {
 				participant->to_dist_sak = true;
 				participant->new_sak = false;
+				/* A rekey just completed under the current
+				 * principal, which satisfies any pending
+				 * deferred post-promotion rekey; drop it so it
+				 * cannot later fire a second, redundant
+				 * rotation. Harmless no-op when none is armed
+				 * (e.g. this rekey was itself the deferred one,
+				 * already fired). */
+				eloop_cancel_timeout(
+					ieee802_1x_kay_deferred_rekey, kay,
+					NULL);
 			}
 		}
 	} else {
