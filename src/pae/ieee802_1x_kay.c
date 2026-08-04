@@ -394,6 +394,16 @@ ieee802_1x_kay_set_principal_participant(
 	ieee802_1x_kay_migrate_principal_sas(kay->principal_participant,
 					     participant);
 
+	/* A pending deferred-rekey request (new_sak) is scoped to the principal
+	 * generation that armed it. Ownership is moving now, so drop any request
+	 * left on the outgoing principal: otherwise, if this CA is re-promoted
+	 * before its own non-principal timer pass clears the flag, its next timer
+	 * would consume the stale request and rekey a CA that has not settled -
+	 * the mid-transition cutover the defer exists to avoid. The incoming
+	 * principal arms its own deferral in reconcile_principal(). */
+	if (kay->principal_participant)
+		kay->principal_participant->new_sak = false;
+
 	kay->principal_participant = participant;
 	kay->principal_generation++;
 	if (participant) {
@@ -4706,8 +4716,18 @@ ieee802_1x_kay_delete_mka(struct ieee802_1x_kay *kay, struct mka_key_name *ckn)
 	/* Recompute CP ownership before teardown, while this participant's SAK
 	 * list is still intact to be migrated: if it owned the CP,
 	 * reconcile_principal() hands ownership (and the re-homed SAK) to a
-	 * surviving CA, or tears the data path down when none remains. Already
-	 * unlinked, so it is not itself a candidate. */
+	 * surviving CA, or tears the data path down when none remains.
+	 *
+	 * Unlinking drops it from select_principal()'s walk, but
+	 * decide_principal()'s follower-retention branch re-selects the current
+	 * principal by pointer, not by list membership - so on the follower side
+	 * (where select_principal() finds no key-server CA) it would re-pick this
+	 * very participant, still active with live peers, leaving no migration or
+	 * teardown and a dangling principal pointer once we free it below. Clear
+	 * ->active so that branch cannot retain it; it stays the principal
+	 * pointer meanwhile, so migrate_principal_sas() can still re-home its SAK
+	 * to the survivor. */
+	participant->active = false;
 	ieee802_1x_kay_reconcile_principal(kay);
 
 	/* each live peer holds a reference on a shared receive SC */
