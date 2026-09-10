@@ -396,6 +396,9 @@ ieee802_1x_kay_set_principal_participant(
 	if (kay->principal_participant == participant)
 		return;
 
+	if (participant && kay->principal_participant)
+		ieee802_1x_cp_abandon_latest_sak(kay->cp);
+
 	ieee802_1x_kay_migrate_principal_sas(kay->principal_participant,
 					     participant);
 
@@ -3093,9 +3096,9 @@ static void ieee802_1x_kay_deferred_rekey(void *eloop_ctx, void *timeout_ctx)
 	if (!principal)
 		return;
 
-	/* Only the key server rekeys, and only with a live peer. If that
-	 * changed since we armed, drop it; the participant timer re-arms if
-	 * the port is left peered with no SA. */
+	/* Only a key server with a live peer may rekey. Otherwise the peer owns
+	 * rekeying, or the next live-peer/ownership transition runs election
+	 * again and schedules a new request. */
 	if (!principal->is_key_server || dl_list_empty(&principal->live_peers))
 		return;
 

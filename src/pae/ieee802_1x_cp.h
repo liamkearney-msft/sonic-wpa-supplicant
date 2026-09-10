@@ -35,5 +35,6 @@ void ieee802_1x_cp_set_usingreceivesas(void *cp_ctx, bool status);
 void ieee802_1x_cp_set_allreceiving(void *cp_ctx, bool status);
 void ieee802_1x_cp_set_servertransmitting(void *cp_ctx, bool status);
 void ieee802_1x_cp_set_usingtransmitas(void *cp_ctx, bool status);
+void ieee802_1x_cp_abandon_latest_sak(void *cp_ctx);
 
 #endif /* IEEE802_1X_CP_H */
