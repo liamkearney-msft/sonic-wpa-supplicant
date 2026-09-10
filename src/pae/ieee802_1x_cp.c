@@ -89,6 +89,7 @@ static void ieee802_1x_cp_retire_when_timeout(void *eloop_ctx,
 					      void *timeout_ctx);
 static void ieee802_1x_cp_transmit_when_timeout(void *eloop_ctx,
 						void *timeout_ctx);
+static void ieee802_1x_cp_step_run(struct ieee802_1x_cp_sm *sm);
 
 
 static int changed_cipher(struct ieee802_1x_cp_sm *sm)
@@ -689,6 +690,43 @@ void ieee802_1x_cp_set_usingtransmitas(void *cp_ctx, bool status)
 {
 	struct ieee802_1x_cp_sm *sm = cp_ctx;
 	sm->using_transmit_sa = status;
+}
+
+
+/**
+ * ieee802_1x_cp_abandon_latest_sak - Drop an unconfirmed SAK on handover
+ *
+ * A principal change cannot retransmit the outgoing CA's Distributed SAK.
+ * Abandon the latest SAK before transmitWhen can enable it, while leaving the
+ * old transmit SAK in place until the incoming principal supplies a
+ * replacement.
+ *
+ * Returns true when an in-progress make-before-break rollover was abandoned.
+ */
+bool ieee802_1x_cp_abandon_latest_sak(void *cp_ctx)
+{
+	struct ieee802_1x_cp_sm *sm = cp_ctx;
+
+	if ((sm->CP_state != CP_RECEIVE &&
+	     sm->CP_state != CP_RECEIVING) ||
+	    !sm->lki || sm->ltx || !sm->oki || !sm->otx)
+		return false;
+
+	eloop_cancel_timeout(ieee802_1x_cp_transmit_when_timeout, sm, NULL);
+	SM_ENTER(CP, ABANDON);
+	ieee802_1x_cp_step_run(sm);
+	return true;
+}
+
+
+/**
+ * ieee802_1x_cp_is_abandoning_sak - Is CP waiting for a replacement SAK?
+ */
+bool ieee802_1x_cp_is_abandoning_sak(void *cp_ctx)
+{
+	struct ieee802_1x_cp_sm *sm = cp_ctx;
+
+	return sm->CP_state == CP_ABANDON;
 }
 
 

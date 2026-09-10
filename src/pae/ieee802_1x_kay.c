@@ -396,6 +396,9 @@ ieee802_1x_kay_set_principal_participant(
 	if (kay->principal_participant == participant)
 		return;
 
+	if (participant && kay->principal_participant)
+		ieee802_1x_cp_abandon_latest_sak(kay->cp);
+
 	ieee802_1x_kay_migrate_principal_sas(kay->principal_participant,
 					     participant);
 
@@ -3132,6 +3135,28 @@ static void ieee802_1x_kay_arm_deferred_rekey(struct ieee802_1x_kay *kay)
 
 
 /**
+ * ieee802_1x_kay_recover_deferred_rekey - Restore a lost required rekey
+ */
+static void ieee802_1x_kay_recover_deferred_rekey(
+	struct ieee802_1x_mka_participant *participant)
+{
+	struct ieee802_1x_kay *kay = participant->kay;
+
+	/* The deferred rekey is a one-shot that drops itself if the principal
+	 * or its live peers changed while it was pending. Re-arm if the SecY
+	 * has no SA, or if CP abandoned an unconfirmed SAK inherited from the
+	 * outgoing principal and is waiting for its replacement. */
+	if (kay->macsec_desired && participant->is_key_server &&
+	    ieee802_1x_kay_is_principal_participant(kay, participant) &&
+	    !dl_list_empty(&participant->live_peers) &&
+	    !participant->new_sak && !participant->to_dist_sak &&
+	    ((kay->txsc && dl_list_empty(&kay->txsc->sa_list)) ||
+	     ieee802_1x_cp_is_abandoning_sak(kay->cp)))
+		ieee802_1x_kay_arm_deferred_rekey(kay);
+}
+
+
+/**
  * ieee802_1x_kay_reconcile_principal - Act on the principal decision
  *
  * Recomputes the CP owner via select_principal(), assigns it, then drives the
@@ -3352,16 +3377,7 @@ static void ieee802_1x_participant_timer(void *eloop_ctx, void *timeout_ctx)
 		ieee802_1x_kay_reconcile_principal(kay);
 	}
 
-	/* The deferred rekey is a one-shot that drops itself if the principal
-	 * or its live peers changed while it was pending, and only an ownership
-	 * move re-arms it. Key off the SecY, not to_use_sak: a dropped rekey
-	 * leaves the bookkeeping claiming a SAK the port does not have. */
-	if (kay->macsec_desired && participant->is_key_server &&
-	    ieee802_1x_kay_is_principal_participant(kay, participant) &&
-	    !dl_list_empty(&participant->live_peers) &&
-	    !participant->new_sak && !participant->to_dist_sak &&
-	    kay->txsc && dl_list_empty(&kay->txsc->sa_list))
-		ieee802_1x_kay_arm_deferred_rekey(kay);
+	ieee802_1x_kay_recover_deferred_rekey(participant);
 
 	/* Only the principal distributes SAKs, so drop any rekey a demoted CA
 	 * was holding. An unowned port is not a demotion, so it must not clear
