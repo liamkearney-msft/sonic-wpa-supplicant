@@ -692,6 +692,22 @@ void ieee802_1x_cp_set_usingtransmitas(void *cp_ctx, bool status)
 }
 
 
+void ieee802_1x_cp_abandon_latest_sak(void *cp_ctx)
+{
+	struct ieee802_1x_cp_sm *sm = cp_ctx;
+
+	if ((sm->CP_state == CP_RECEIVE ||
+	     sm->CP_state == CP_RECEIVING) &&
+	    sm->lki && !sm->ltx && sm->oki && sm->otx) {
+		/* Keep the old SAK active if a peer missed DistSAK on CA change. */
+		eloop_cancel_timeout(ieee802_1x_cp_transmit_when_timeout,
+				     sm, NULL);
+		SM_ENTER(CP, ABANDON);
+		ieee802_1x_cp_sm_step(sm);
+	}
+}
+
+
 /**
  * ieee802_1x_cp_sm_step - Advance EAPOL state machines
  * @sm: EAPOL state machine
