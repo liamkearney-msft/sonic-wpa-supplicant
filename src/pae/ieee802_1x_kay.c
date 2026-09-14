@@ -4924,6 +4924,10 @@ ieee802_1x_kay_change_cipher_suite(struct ieee802_1x_kay *kay,
  * Query KaY status information. This function fills in a text area with current
  * status information. If the buffer (buf) is not large enough, status
  * information will be truncated to fit the buffer.
+ *
+ * A complete snapshot ends with snapshot_complete=1. Readers must treat a reply
+ * without it as truncated and discard it, since a cut can otherwise land on a
+ * participant boundary and look well formed.
  */
 int ieee802_1x_kay_get_status(struct ieee802_1x_kay *kay, char *buf,
 			      size_t buflen)
@@ -4970,13 +4974,13 @@ int ieee802_1x_kay_get_status(struct ieee802_1x_kay *kay, char *buf,
 	res = os_snprintf(pos, end - pos,
 			  "actor_sci=%s\n", sci_txt(&kay->actor_sci));
 	if (os_snprintf_error(end - pos, res))
-		return end - pos;
+		return pos - buf;
 	pos += res;
 
 	res = os_snprintf(pos, end - pos,
 			  "key_server_sci=%s\n", sci_txt(&kay->key_server_sci));
 	if (os_snprintf_error(end - pos, res))
-		return end - pos;
+		return pos - buf;
 	pos += res;
 
 	count = 0;
@@ -4987,7 +4991,7 @@ int ieee802_1x_kay_get_status(struct ieee802_1x_kay *kay, char *buf,
 		res = os_snprintf(pos2, end - pos2, "participant_idx=%d\nckn=",
 			count);
 		if (os_snprintf_error(end - pos2, res))
-			return end - pos;
+			return pos - buf;
 		pos2 += res;
 		count++;
 
@@ -5001,7 +5005,7 @@ int ieee802_1x_kay_get_status(struct ieee802_1x_kay *kay, char *buf,
 				  "participant=%s\n"
 				  "retain=%s\n"
 				  "is_principal=%s\n"
-				  "is_primary=%s\n"
+				  "is_fallback=%s\n"
 				  "live_peers=%u\n"
 				  "potential_peers=%u\n"
 				  "is_key_server=%s\n"
@@ -5011,16 +5015,24 @@ int ieee802_1x_kay_get_status(struct ieee802_1x_kay *kay, char *buf,
 				  yes_no(p->participant),
 				  yes_no(p->retain),
 				  yes_no(p == kay->principal_participant),
-				  yes_no(p->is_primary),
+				  yes_no(!p->is_primary),
 				  dl_list_len(&p->live_peers),
 				  dl_list_len(&p->potential_peers),
 				  yes_no(p->is_key_server),
 				  yes_no(p->is_elected));
 		if (os_snprintf_error(end - pos2, res))
-			return end - pos;
+			return pos - buf;
 		pos2 += res;
 		pos = pos2;
 	}
+
+	/* Whole-snapshot marker. Every truncation above returns with pos at the
+	 * last complete block, so a short reply never carries it - including a
+	 * cut that lands on a participant boundary. */
+	res = os_snprintf(pos, end - pos, "snapshot_complete=1\n");
+	if (os_snprintf_error(end - pos, res))
+		return pos - buf;
+	pos += res;
 
 	return pos - buf;
 }
@@ -5214,3 +5226,164 @@ int ieee802_1x_kay_get_mib(struct ieee802_1x_kay *kay, char *buf,
 }
 
 #endif /* CONFIG_CTRL_IFACE */
+
+
+#if defined(CONFIG_MODULE_TESTS) && defined(CONFIG_CTRL_IFACE)
+
+#define KAY_TEST_SECRET_BYTE 0xde
+#define KAY_TEST_SECRET_HEX "dededededededede"
+
+static void kay_test_participant(struct ieee802_1x_kay *kay,
+				 struct ieee802_1x_mka_participant *p,
+				 bool primary, u8 ckn_byte, u8 mi_byte)
+{
+	os_memset(p, 0, sizeof(*p));
+	p->kay = kay;
+	p->is_primary = primary;
+	p->active = true;
+	p->participant = true;
+	p->retain = true;
+	p->is_key_server = primary;
+	p->is_elected = primary;
+	p->mn = 42;
+
+	p->ckn.len = MAX_CKN_LEN;
+	os_memset(p->ckn.name, ckn_byte, p->ckn.len);
+	os_memset(p->mi, mi_byte, MI_LEN);
+
+	/* Key material the snapshot must never serialize. */
+	p->cak.len = MAX_KEY_LEN;
+	os_memset(p->cak.key, KAY_TEST_SECRET_BYTE, p->cak.len);
+	p->kek.len = MAX_KEY_LEN;
+	os_memset(p->kek.key, KAY_TEST_SECRET_BYTE, p->kek.len);
+	p->ick.len = MAX_KEY_LEN;
+	os_memset(p->ick.key, KAY_TEST_SECRET_BYTE, p->ick.len);
+
+	dl_list_init(&p->live_peers);
+	dl_list_init(&p->potential_peers);
+	dl_list_init(&p->sak_list);
+	dl_list_add_tail(&kay->participant_list, &p->list);
+}
+
+
+/* Every field the sonic-swss consumer reads out of one snapshot. */
+static const char * const kay_test_fields[] = {
+	"PAE KaY status=", "Authenticated=", "Secured=", "Failed=",
+	"Actor Priority=", "Key Server Priority=", "Is Key Server=",
+	"Number of Keys Distributed=", "Number of Keys Received=",
+	"MKA Hello Time=", "actor_sci=", "key_server_sci=",
+	"participant_idx=0\n", "participant_idx=1\n",
+	"ckn=", "mi=", "mn=42\n", "active=", "participant=", "retain=",
+	"is_principal=", "is_fallback=", "live_peers=", "potential_peers=",
+	"is_key_server=", "is_elected=",
+};
+
+
+/* Search for needle only within [start, end). */
+static bool kay_test_field_in(const char *start, const char *end,
+			      const char *needle)
+{
+	const char *hit = os_strstr(start, needle);
+
+	return hit && hit + os_strlen(needle) <= end;
+}
+
+
+int ieee802_1x_kay_module_tests(void)
+{
+	struct ieee802_1x_kay kay;
+	struct ieee802_1x_mka_participant primary, fallback;
+	const char *marker = "snapshot_complete=1\n";
+	const char *p0, *p1;
+	char buf[4096], tmp[sizeof(buf) + 1];
+	size_t i;
+	int len, ret = -1;
+
+	os_memset(&kay, 0, sizeof(kay));
+	dl_list_init(&kay.participant_list);
+	kay.active = true;
+	kay.authenticated = true;
+	kay.secured = true;
+	kay.actor_priority = 16;
+	kay.key_server_priority = 16;
+	kay.dist_kn = 3;
+	kay.rcvd_keys = 2;
+	kay.mka_hello_time = MKA_HELLO_TIME;
+	os_memset(kay.actor_sci.addr, 0x02, ETH_ALEN);
+	kay.actor_sci.port = host_to_be16(1);
+	/* key_server_sci stays zeroed: the pre-election snapshot. */
+
+	kay_test_participant(&kay, &primary, true, 0xc1, 0x11);
+	kay_test_participant(&kay, &fallback, false, 0xc2, 0x22);
+	kay.principal_participant = &primary;
+
+	/* Two participants with maximum-length CKNs must fit the 4096-byte
+	 * control-interface reply whole. */
+	len = ieee802_1x_kay_get_status(&kay, buf, sizeof(buf));
+	if (len <= 0 || (size_t) len >= sizeof(buf))
+		goto fail;
+	buf[len] = '\0';
+
+	for (i = 0; i < ARRAY_SIZE(kay_test_fields); i++) {
+		if (!os_strstr(buf, kay_test_fields[i])) {
+			wpa_printf(MSG_ERROR, "KaY test: missing %s",
+				   kay_test_fields[i]);
+			goto fail;
+		}
+	}
+
+	/* is_fallback is canonical, and must track the role rather than just
+	 * appearing once per polarity: idx 0 is primary, idx 1 fallback. */
+	if (os_strstr(buf, "is_primary="))
+		goto fail;
+	p0 = os_strstr(buf, "participant_idx=0\n");
+	p1 = os_strstr(buf, "participant_idx=1\n");
+	if (!p0 || !p1 || p1 < p0)
+		goto fail;
+	if (!kay_test_field_in(p0, p1, "is_fallback=No\n") ||
+	    !kay_test_field_in(p1, buf + len, "is_fallback=Yes\n"))
+		goto fail;
+
+	if (!os_strstr(buf, "key_server_sci=00:00:00:00:00:00@0\n"))
+		goto fail;
+
+	if (os_strstr(buf, KAY_TEST_SECRET_HEX))
+		goto fail;
+
+	/* The marker terminates a whole snapshot. */
+	if (os_strcmp(buf + len - os_strlen(marker), marker) != 0)
+		goto fail;
+
+	/* Every short buffer must drop the marker, including the lengths that
+	 * cut exactly on a participant boundary. */
+	for (i = 0; i < (size_t) len; i++) {
+		int n;
+
+		os_memset(tmp, 'X', sizeof(tmp));
+		n = ieee802_1x_kay_get_status(&kay, tmp, i);
+
+		/* A truncating call reports the bytes it wrote, which end at
+		 * the last complete block. */
+		if (n < 0 || (size_t) n > i || (n && tmp[n - 1] != '\n')) {
+			wpa_printf(MSG_ERROR,
+				   "KaY test: %zu-byte buffer reported %d bytes",
+				   i, n);
+			goto fail;
+		}
+		tmp[n] = '\0';
+		if (os_strstr(tmp, marker)) {
+			wpa_printf(MSG_ERROR,
+				   "KaY test: truncated snapshot at %zu bytes carries the marker",
+				   i);
+			goto fail;
+		}
+	}
+
+	ret = 0;
+fail:
+	if (ret)
+		wpa_printf(MSG_ERROR, "KaY module test failure: MKA status");
+	return ret;
+}
+
+#endif /* CONFIG_MODULE_TESTS && CONFIG_CTRL_IFACE */

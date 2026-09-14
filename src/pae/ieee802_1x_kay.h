@@ -328,4 +328,8 @@ int ieee802_1x_kay_get_macsec(struct ieee802_1x_kay *kay, char *buf,
 int ieee802_1x_kay_get_mib(struct ieee802_1x_kay *kay, char *buf,
 			   size_t buflen);
 
+#if defined(CONFIG_MODULE_TESTS) && defined(CONFIG_CTRL_IFACE)
+int ieee802_1x_kay_module_tests(void);
+#endif /* CONFIG_MODULE_TESTS && CONFIG_CTRL_IFACE */
+
 #endif /* IEEE802_1X_KAY_H */
