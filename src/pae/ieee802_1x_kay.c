@@ -1647,6 +1647,7 @@ ieee802_1x_mka_decode_sak_use_body(
 	struct ieee802_1x_mka_ki ki;
 	u64 lpn;
 	struct ieee802_1x_kay *kay = participant->kay;
+	struct ieee802_1x_mka_participant *owner;
 	u32 olpn, llpn;
 	bool is_principal;
 
@@ -1701,13 +1702,22 @@ ieee802_1x_mka_decode_sak_use_body(
 	olpn = be_to_host32(body->olpn);
 	llpn = be_to_host32(body->llpn);
 
+	/* A standby actor can include SAK Use for liveness while leaving both
+	 * the latest and old key state clear. */
+	if (!body->lrx && !body->ltx && !body->orx && !body->otx)
+		return 0;
+
 	/* Our most recent distributed key should be the first in the list.
+	 * The installed key follows the principal because all actors share the
+	 * same SecY. A standby peer may therefore report either no key state or
+	 * the same key state as the principal actor.
 	 * If it doesn't exist then we can't really do anything.
 	 * Be lenient and don't return error here as there are legitimate cases
 	 * where this can happen such as when a new participant joins the CA and
 	 * the first frame it receives can have a SAKuse but not distSAK.
 	 */
-	sa_key = dl_list_first(&participant->sak_list, struct data_key, list);
+	owner = ieee802_1x_kay_principal_or_self(participant);
+	sa_key = dl_list_first(&owner->sak_list, struct data_key, list);
 	if (!sa_key) {
 		wpa_printf(MSG_INFO,
 			   "KaY: We don't have a latest distributed key - ignore SAK use");
