@@ -1647,9 +1647,21 @@ ieee802_1x_mka_decode_sak_use_body(
 	struct ieee802_1x_mka_ki ki;
 	u64 lpn;
 	struct ieee802_1x_kay *kay = participant->kay;
-	struct ieee802_1x_mka_participant *owner;
 	u32 olpn, llpn;
-	bool is_principal;
+
+	hdr = (struct ieee802_1x_mka_hdr *) mka_msg;
+	body_len = get_mka_param_body_len(hdr);
+	if ((body_len != 0) && (body_len < 40)) {
+		wpa_printf(MSG_ERROR,
+			   "KaY: MKA Use SAK Packet Body Length (%zu bytes) should be 0, 40, or more octets",
+			   body_len);
+		return -1;
+	}
+
+	/* A standby participant uses the presence of SAK Use only for peer
+	 * liveness. The principal alone interprets the shared SecY key state. */
+	if (!ieee802_1x_kay_is_principal_participant(kay, participant))
+		return 0;
 
 	/* Ignore a SAK Use from a peer we have not yet promoted to live (a
 	 * transient during liveness establishment, wider under rekey/failover
@@ -1665,17 +1677,8 @@ ieee802_1x_mka_decode_sak_use_body(
 		return 0;
 	}
 
-	hdr = (struct ieee802_1x_mka_hdr *) mka_msg;
-	body_len = get_mka_param_body_len(hdr);
 	body = (struct ieee802_1x_mka_sak_use_body *) mka_msg;
 	ieee802_1x_mka_dump_sak_use_body(body);
-
-	if ((body_len != 0) && (body_len < 40)) {
-		wpa_printf(MSG_ERROR,
-			   "KaY: MKA Use SAK Packet Body Length (%zu bytes) should be 0, 40, or more octets",
-			   body_len);
-		return -1;
-	}
 
 	/* TODO: what action should I take when peer does not support MACsec */
 	if (body_len == 0) {
@@ -1708,16 +1711,12 @@ ieee802_1x_mka_decode_sak_use_body(
 		return 0;
 
 	/* Our most recent distributed key should be the first in the list.
-	 * The installed key follows the principal because all actors share the
-	 * same SecY. A standby peer may therefore report either no key state or
-	 * the same key state as the principal actor.
 	 * If it doesn't exist then we can't really do anything.
 	 * Be lenient and don't return error here as there are legitimate cases
 	 * where this can happen such as when a new participant joins the CA and
 	 * the first frame it receives can have a SAKuse but not distSAK.
 	 */
-	owner = ieee802_1x_kay_principal_or_self(participant);
-	sa_key = dl_list_first(&owner->sak_list, struct data_key, list);
+	sa_key = dl_list_first(&participant->sak_list, struct data_key, list);
 	if (!sa_key) {
 		wpa_printf(MSG_INFO,
 			   "KaY: We don't have a latest distributed key - ignore SAK use");
@@ -1789,14 +1788,7 @@ ieee802_1x_mka_decode_sak_use_body(
 	/* The key server must check that all peers are using the most recent
 	 * distributed key. Non key servers must check if the key server is
 	 * transmitting.
-	 *
-	 * Only the principal drives the shared CP: a standby CA tracks peer
-	 * state for its own promotion, but must never publish that view to the
-	 * port's state machine.
 	 */
-	is_principal = ieee802_1x_kay_is_principal_participant(kay,
-							       participant);
-
 	if (participant->is_key_server) {
 		struct ieee802_1x_kay_peer *peer_iter;
 		bool all_receiving = true;
@@ -1814,12 +1806,10 @@ ieee802_1x_mka_decode_sak_use_body(
 
 		if (all_receiving) {
 			participant->to_dist_sak = false;
-			if (is_principal) {
-				ieee802_1x_cp_set_allreceiving(kay->cp, true);
-				ieee802_1x_cp_sm_step(kay->cp);
-			}
+			ieee802_1x_cp_set_allreceiving(kay->cp, true);
+			ieee802_1x_cp_sm_step(kay->cp);
 		}
-	} else if (is_principal && peer->is_key_server && body->ltx) {
+	} else if (peer->is_key_server && body->ltx) {
 		ieee802_1x_cp_set_servertransmitting(kay->cp, true);
 		ieee802_1x_cp_sm_step(kay->cp);
 	}
