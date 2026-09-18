@@ -95,7 +95,6 @@ struct ieee802_1x_mka_participant {
 
 	/* used by management to monitor and control activation */
 	bool active;
-	bool participant;
 	bool retain;
 	enum mka_created_mode mode;
 

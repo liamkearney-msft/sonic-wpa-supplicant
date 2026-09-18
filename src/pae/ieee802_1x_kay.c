@@ -4521,7 +4521,6 @@ ieee802_1x_kay_create_mka(struct ieee802_1x_kay *kay,
 	participant->cached = false;
 
 	participant->active = false;
-	participant->participant = false;
 	participant->retain = false;
 	participant->activate = DEFAULT;
 
@@ -4875,7 +4874,6 @@ int ieee802_1x_kay_get_status(struct ieee802_1x_kay *kay, char *buf,
 				  "\nmi=%s\n"
 				  "mn=%u\n"
 				  "active=%s\n"
-				  "participant=%s\n"
 				  "retain=%s\n"
 				  "is_principal=%s\n"
 				  "is_primary=%s\n"
@@ -4885,7 +4883,6 @@ int ieee802_1x_kay_get_status(struct ieee802_1x_kay *kay, char *buf,
 				  "is_elected=%s\n",
 				  mi_txt(p->mi), p->mn,
 				  yes_no(p->active),
-				  yes_no(p->participant),
 				  yes_no(p->retain),
 				  yes_no(p == kay->principal_participant),
 				  yes_no(p->is_primary),
