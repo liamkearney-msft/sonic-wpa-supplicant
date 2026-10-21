@@ -645,6 +645,39 @@ def test_wpas_config_file_sae(dev, apdev, params):
     wpas.save_config()
     check_network_config(config, False)
 
+def test_wpas_config_file_macsec_fallback(dev, apdev, params):
+    """wpa_supplicant config file preserves fallback MACsec keys"""
+    config = os.path.join(params['logdir'], 'wpas_config_macsec_fallback.conf')
+    with open(config, "w") as f:
+        f.write("update_config=1\n")
+    wpas = WpaSupplicant(global_iface='/tmp/wpas-wlan5')
+    wpas.interface_add("wlan5", config=config, driver="none")
+    id = wpas.add_network()
+    if "OK" not in wpas.request("SET_NETWORK %d macsec_policy 1" % id):
+        raise HwsimSkip("MACsec not supported")
+    wpas.set_network(id, "key_mgmt", "NONE")
+    wpas.save_config()
+    with open(config, "r") as f:
+        if "_fallback=" in f.read():
+            raise Exception("Unset fallback keys written to configuration")
+
+    for cak in ["0123456789abcdef" * 2, "0123456789abcdef" * 4]:
+        keys = {"mka_cak": cak,
+                "mka_ckn": "01",
+                "mka_cak_fallback": cak,
+                "mka_ckn_fallback": "02" * 32}
+        for field, value in keys.items():
+            wpas.set_network(id, field, value)
+        wpas.save_config()
+        if "OK" not in wpas.request("RECONFIGURE"):
+            raise Exception("Could not reload MACsec configuration")
+        wpas.save_config()
+        with open(config, "r") as f:
+            data = f.read()
+        for field, value in keys.items():
+            if "\t%s=%s\n" % (field, value) not in data:
+                raise Exception("MACsec configuration lost field " + field)
+
 def test_wpas_config_update_without_file(dev, apdev):
     """wpa_supplicant SAVE_CONFIG without config file"""
     wpas = WpaSupplicant(global_iface='/tmp/wpas-wlan5')
