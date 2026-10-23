@@ -1658,8 +1658,8 @@ ieee802_1x_mka_decode_sak_use_body(
 		return -1;
 	}
 
-	/* A standby participant uses the presence of SAK Use only for peer
-	 * liveness. The principal alone interprets the shared SecY key state. */
+	/* The principal alone interprets the shared SecY key state. Per-CA
+	 * liveness is checked against the peer list by decode_mkpdu(). */
 	if (!ieee802_1x_kay_is_principal_participant(kay, participant))
 		return 0;
 
@@ -2183,18 +2183,6 @@ ieee802_1x_mka_decode_dist_sak_body(
 
 	kay->rcvd_keys++;
 	participant->to_use_sak = true;
-
-	/**
-	 * Because the key server may not include dist sak and use sak in ONE packet,
-	 * Meanwhile, after dist sak, the current participant(Non-Key Server) will
-	 * install SC or SA(s) after decoding the dist sak which may take few seconds
-	 * in real physical platforms. Meanwhile, the peer expire time is always
-	 * initialized at adding the key server to peer list. The gap between adding
-	 * the key server to peer list and processing next use sak packet may exceed
-	 * the threshold of MKA_LIFE_TIME(6s). It will cause an unexpected cleanup
-	 * (delete SC and SA(s)). So, update the expire timeout at dist sak also.
-	 */
-	peer->expire = time(NULL) + MKA_LIFE_TIME / 1000;
 
 	return 0;
 }
@@ -3017,6 +3005,8 @@ ieee802_1x_kay_migrate_principal_sas(
 	 * installed SAK until the next rekey. */
 	new_principal->to_use_sak = old->to_use_sak;
 	new_principal->new_key = old->new_key;
+	new_principal->advised_desired = old->advised_desired;
+	new_principal->advised_capability = old->advised_capability;
 
 	old->new_key = NULL;
 	old->to_use_sak = false;
@@ -4147,10 +4137,13 @@ static int ieee802_1x_kay_decode_mkpdu(struct ieee802_1x_kay *kay,
 		} else {
 			peer->missing_sak_use_count = 0;
 
-			wpa_printf(MSG_INFO, "KaY: Update watchdog timer, SAK-USE set");
-			/* Only update live peer watchdog after successful
-			 * decode of all parameter sets */
-			peer->expire = time(NULL) + MKA_LIFE_TIME / 1000;
+			/* Renew after parameter processing, but only if the peer
+			 * acknowledged this CA's recent MI/MN. */
+			if (i_in_peerlist) {
+				wpa_printf(MSG_INFO,
+					   "KaY: Update watchdog timer, SAK-USE set");
+				peer->expire = time(NULL) + MKA_LIFE_TIME / 1000;
+			}
 		}
 	} else {
 		/* MKPDU is from new or potential peer */
