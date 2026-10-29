@@ -1981,7 +1981,8 @@ static void ieee802_1x_kay_init_data_key(struct data_key *pkey)
 /* Defined later in this file; needed by the DIST_SAK "follow the key server"
  * path to hand controlled-port ownership to the CA the key server is keying. */
 static int
-ieee802_1x_kay_elect_key_server(struct ieee802_1x_mka_participant *participant);
+ieee802_1x_kay_elect_key_server(struct ieee802_1x_mka_participant *participant,
+			      bool principal_change);
 static bool
 ieee802_1x_kay_peer_is_elected_key_server(
 	struct ieee802_1x_mka_participant *participant,
@@ -2138,7 +2139,7 @@ ieee802_1x_mka_decode_dist_sak_body(
 			   "KaY: Following key server onto CKN %s for controlled-port ownership",
 			   ckn_txt(&participant->ckn));
 		ieee802_1x_kay_set_principal_participant(kay, participant);
-		ieee802_1x_kay_elect_key_server(participant);
+		ieee802_1x_kay_elect_key_server(participant, true);
 	}
 
 	kay->macsec_csindex = csindex;
@@ -2688,7 +2689,8 @@ ieee802_1x_kay_peer_is_elected_key_server(
  * when to elect: whenever the live peers list changes
  */
 static int
-ieee802_1x_kay_elect_key_server(struct ieee802_1x_mka_participant *participant)
+ieee802_1x_kay_elect_key_server(struct ieee802_1x_mka_participant *participant,
+			      bool principal_change)
 {
 	struct ieee802_1x_kay_peer *peer;
 	struct ieee802_1x_kay_peer *key_server = NULL;
@@ -2762,10 +2764,12 @@ ieee802_1x_kay_elect_key_server(struct ieee802_1x_mka_participant *participant)
 			ieee802_1x_cp_sm_step(kay->cp);
 		}
 
-		/* A cold bring-up needs its first SAK now. Once a SAK is
-		 * installed, distributing a fresh one inline races the datapath
-		 * while both ends are still converging, so defer instead. */
-		if (participant->to_use_sak)
+		/* Defer a handover with a retained SAK, preserving any pending
+		 * settle window. Ordinary peer elections need no new window. */
+		if (participant->to_use_sak &&
+		    (principal_change ||
+		     eloop_is_timeout_registered(ieee802_1x_kay_deferred_rekey,
+						 kay, NULL)))
 			ieee802_1x_kay_arm_deferred_rekey(kay);
 		else
 			participant->new_sak = true;
@@ -3148,7 +3152,7 @@ ieee802_1x_kay_reconcile_principal(struct ieee802_1x_kay *kay)
 		/* Re-elect only when ownership actually moved; doing it every
 		 * pass would re-arm the deferred rekey each tick. */
 		if (want != prev)
-			ieee802_1x_kay_elect_key_server(want);
+			ieee802_1x_kay_elect_key_server(want, true);
 		ieee802_1x_kay_decide_macsec_use(want);
 		return;
 	}
@@ -3302,7 +3306,7 @@ static void ieee802_1x_participant_timer(void *eloop_ctx, void *timeout_ctx)
 
 	if (lp_changed) {
 		if (!dl_list_empty(&participant->live_peers))
-			ieee802_1x_kay_elect_key_server(participant);
+			ieee802_1x_kay_elect_key_server(participant, false);
 
 		/* Reconcile before quiescing a now-peerless CA: the migration
 		 * below carries to_use_sak onto the new principal, so clearing
@@ -4017,7 +4021,7 @@ static int ieee802_1x_kay_decode_mkpdu(struct ieee802_1x_kay *kay,
 			os_free(peer);
 		}
 
-		ieee802_1x_kay_elect_key_server(participant);
+		ieee802_1x_kay_elect_key_server(participant, false);
 		/* A new live peer may change which CA should own the controlled
 		 * port (initial claim or revertive fail-back to primary). */
 		ieee802_1x_kay_reconcile_principal(participant->kay);
