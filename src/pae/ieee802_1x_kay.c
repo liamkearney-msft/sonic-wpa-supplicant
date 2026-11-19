@@ -1557,11 +1557,6 @@ ieee802_1x_mka_encode_sak_use_body(
 	body->ptx = !kay->macsec_protect;
 	body->prx = kay->macsec_validate != Strict;
 
-	/* The SAK Use parameter remains present on standby actors, but only the
-	 * principal actor reports the shared SecY's key state. */
-	if (participant != owner)
-		return 0;
-
 	/* data delay protect */
 	body->delay_protect = kay->mka_hello_time <= MKA_BOUNDED_HELLO_TIME;
 
@@ -1612,10 +1607,10 @@ ieee802_1x_mka_encode_sak_use_body(
 
 	/* old key: rx, tx, key server member identifier key number */
 	body->oan = kay->oan;
-	if (kay->oki.kn != kay->lki.kn &&
-	    kay->oki.kn != 0) {
-		body->otx = true;
-		body->orx = true;
+	if (kay->oki.kn != 0 &&
+	    !is_ki_equal(&kay->oki, &kay->lki)) {
+		body->otx = kay->otx;
+		body->orx = kay->orx;
 		os_memcpy(body->osrv_mi, kay->oki.mi,
 			  sizeof(body->osrv_mi));
 		body->okn = host_to_be32(kay->oki.kn);
@@ -1623,6 +1618,10 @@ ieee802_1x_mka_encode_sak_use_body(
 		body->otx = false;
 		body->orx = false;
 	}
+
+	/* Standby actors report shared key state without driving the CP. */
+	if (participant != owner)
+		return 0;
 
 	/* set CP's variable */
 	if (body->ltx) {
@@ -1654,6 +1653,7 @@ ieee802_1x_mka_decode_sak_use_body(
 	u64 lpn;
 	struct ieee802_1x_kay *kay = participant->kay;
 	u32 olpn, llpn;
+	bool peer_transmitting;
 
 	hdr = (struct ieee802_1x_mka_hdr *) mka_msg;
 	body_len = get_mka_param_body_len(hdr);
@@ -1743,10 +1743,12 @@ ieee802_1x_mka_decode_sak_use_body(
 		os_memcpy(ki.mi, body->lsrv_mi, sizeof(ki.mi));
 		ki.kn = be_to_host32(body->lkn);
 		lpn = llpn;
+		peer_transmitting = body->ltx;
 	} else {
 		os_memcpy(ki.mi, body->osrv_mi, sizeof(ki.mi));
 		ki.kn = be_to_host32(body->okn);
 		lpn = olpn;
+		peer_transmitting = body->otx;
 	}
 
 	/* If the most recent distributed keys don't agree then someone is out
@@ -1809,10 +1811,8 @@ ieee802_1x_mka_decode_sak_use_body(
 
 		/* Distributed keys are equal from above comparison. */
 		peer->sak_used = true;
-		/* The peer is transmitting on our latest key once it advertises
-		 * latest-key tx (body->ltx) for a latest key that matches ours
-		 * (body->lrx, matched above). */
-		peer->sak_txed = body->lrx && body->ltx;
+		/* The matched key may occupy either peer SAK Use slot. */
+		peer->sak_txed = peer_transmitting;
 		/* No early break: both gates need to be computed across the
 		 * whole live set, not just up to the first laggard peer. */
 		dl_list_for_each(peer_iter, &participant->live_peers,
@@ -1835,7 +1835,7 @@ ieee802_1x_mka_decode_sak_use_body(
 						   all_transmitting);
 		if (all_receiving || all_transmitting)
 			ieee802_1x_cp_sm_step(kay->cp);
-	} else if (peer->is_key_server && body->ltx) {
+	} else if (peer->is_key_server && peer_transmitting) {
 		ieee802_1x_cp_set_servertransmitting(kay->cp, true);
 		ieee802_1x_cp_sm_step(kay->cp);
 	}
