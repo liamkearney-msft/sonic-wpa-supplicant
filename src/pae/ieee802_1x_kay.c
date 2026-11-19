@@ -4246,7 +4246,8 @@ static int ieee802_1x_kay_decode_mkpdu(struct ieee802_1x_kay *kay,
 			 * This handles the case where SAK-USE is temporarily missing during
 			 * session establishment. */
 			if (i_in_peerlist) {
-				wpa_printf(MSG_INFO, "KaY: Update watchdog timer, SAK-USE not set ");
+				wpa_printf(MSG_DEBUG,
+					   "KaY: Update watchdog timer, SAK-USE not set");
 				peer->expire = time(NULL) + MKA_LIFE_TIME / 1000;
 			}
 		} else {
@@ -4255,7 +4256,7 @@ static int ieee802_1x_kay_decode_mkpdu(struct ieee802_1x_kay *kay,
 			/* Renew after parameter processing, but only if the peer
 			 * acknowledged this CA's recent MI/MN. */
 			if (i_in_peerlist) {
-				wpa_printf(MSG_INFO,
+				wpa_printf(MSG_DEBUG,
 					   "KaY: Update watchdog timer, SAK-USE set");
 				peer->expire = time(NULL) + MKA_LIFE_TIME / 1000;
 			}
