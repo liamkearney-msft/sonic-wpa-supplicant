@@ -1,7 +1,5 @@
 /*
- * IEEE 802.1X-2010 CP state machine regression test: CP_TRANSMIT must not
- * become a dead-end when usingTransmitSA never asserts (e.g. the transmit SA
- * was deleted by a rekey/peer-flap teardown before enable_tx_sas() ran).
+ * IEEE 802.1X-2010 CP TX commitment and completion-timeout regressions.
  *
  * Self-contained: #includes the module under test and stubs its KaY/SecY/
  * eloop/logging deps (stub signatures compiler-checked against the headers).
@@ -14,6 +12,7 @@
 #include "common/defs.h"
 #include "common/ieee802_1x_defs.h"
 #include "pae/ieee802_1x_kay.h"
+#include "pae/ieee802_1x_cp.h"
 #include "pae/ieee802_1x_secy_ops.h"
 #include "utils/eloop.h"
 
@@ -57,8 +56,7 @@ int secy_cp_control_enable_port(struct ieee802_1x_kay *kay, bool flag)
 
 /*
  * KaY ops: no-ops. Crucially ieee802_1x_kay_enable_tx_sas() does NOT assert
- * usingTransmitSA here -- that models the field failure where the transmit SA
- * is gone by the time CP_TRANSMIT runs.
+ * usingTransmitSA here -- that models a queued selection without completion.
  */
 int ieee802_1x_kay_set_latest_sa_attr(struct ieee802_1x_kay *kay,
 				      struct ieee802_1x_mka_ki *lki, u8 lan,
@@ -79,9 +77,23 @@ int ieee802_1x_kay_enable_tx_sas(struct ieee802_1x_kay *kay,
 { (void) kay; (void) lki; return 0; }
 int ieee802_1x_kay_enable_rx_sas(struct ieee802_1x_kay *kay,
 				 struct ieee802_1x_mka_ki *lki)
-{ (void) kay; (void) lki; return 0; }
+{
+	(void) lki;
+	ieee802_1x_cp_set_usingreceivesas(kay->cp, true);
+	return 0;
+}
 int ieee802_1x_kay_enable_new_info(struct ieee802_1x_kay *kay)
 { (void) kay; return 0; }
+bool ieee802_1x_kay_can_transmit_sak(struct ieee802_1x_kay *kay,
+				   const struct ieee802_1x_mka_ki *ki)
+{ (void) kay; (void) ki; return true; }
+bool ieee802_1x_kay_can_abandon_sak(struct ieee802_1x_kay *kay)
+{ (void) kay; return true; }
+void ieee802_1x_kay_abandon_sak(struct ieee802_1x_kay *kay,
+			       const struct ieee802_1x_mka_ki *ki)
+{ (void) kay; (void) ki; }
+void ieee802_1x_kay_rekey_failed(struct ieee802_1x_kay *kay)
+{ (void) kay; }
 
 /* eloop: no-ops. The test drives the SM synchronously; no timers needed. */
 int eloop_cancel_timeout(eloop_timeout_handler handler, void *eloop_data,
@@ -141,11 +153,11 @@ static struct ieee802_1x_cp_sm * drive_to_transmit(struct ieee802_1x_kay *kay)
 
 	if (!sm)
 		return NULL;
+	kay->cp = sm;
 
 	/* Elected key server, secure connectivity, a SAK to install, and the
 	 * receive SAs already in use -> SECURED -> RECEIVE -> RECEIVING ->
-	 * TRANSMIT. controlled_port_enabled is still false here, which is the
-	 * RECEIVING->TRANSMIT trigger for the elected self. */
+	 * TRANSMIT. The readiness stub supplies peer RX confirmation. */
 	sm->connect = SECURE;
 	sm->elected_self = true;
 	sm->new_sak = true;
@@ -157,14 +169,14 @@ static struct ieee802_1x_cp_sm * drive_to_transmit(struct ieee802_1x_kay *kay)
 }
 
 /*
- * The bug: CP wedged in CP_TRANSMIT never leaves on a new SAK. A correct CP
- * escapes to ABANDON/RECEIVE. FAILS on the unfixed tree, PASSES on the fixed.
+ * A replacement must not cancel a selection that hardware may already have
+ * accepted. Completion or an explicit bounded failure resolves it.
  */
-static void test_wedge_escapes_on_new_sak(struct ieee802_1x_kay *kay)
+static void test_pending_selection_survives_new_sak(struct ieee802_1x_kay *kay)
 {
 	struct ieee802_1x_cp_sm *sm = drive_to_transmit(kay);
 
-	printf("test: escape CP_TRANSMIT on new SAK\n");
+	printf("test: preserve pending TX selection on new SAK\n");
 	CHECK(sm != NULL, "CP SM initialised");
 	if (!sm)
 		return;
@@ -174,16 +186,16 @@ static void test_wedge_escapes_on_new_sak(struct ieee802_1x_kay *kay)
 	CHECK(sm->CP_state == CP_TRANSMIT,
 	      "precondition: CP is in CP_TRANSMIT with no transmit SA");
 
-	/* Next rekey: KaY distributes a new SAK while CP is stuck in TRANSMIT.
-	 * One SM step decides the fate: the fixed CP takes the new escape to
-	 * ABANDON; the buggy CP has no CP_TRANSMIT exit but usingTransmitSA and
-	 * stays put. */
 	sm->new_sak = true;
 	sm_CP_Step(sm);
 
 	printf("  after new SAK, state %s\n", cp_state_name(sm->CP_state));
-	CHECK(sm->CP_state != CP_TRANSMIT,
-	      "CP left CP_TRANSMIT after new SAK (did not wedge)");
+	CHECK(sm->CP_state == CP_TRANSMIT && sm->tx_selection_started,
+	      "CP preserved the pending selection instead of abandoning it");
+	sm->transmit_when = 0;
+	sm_CP_Step(sm);
+	CHECK(sm->CP_state == CP_CHANGE,
+	      "Unconfirmed TX selection has a bounded controlled-port reset");
 
 	ieee802_1x_cp_sm_deinit(sm);
 }
@@ -214,33 +226,28 @@ static void test_healthy_path_reaches_transmitting(struct ieee802_1x_kay *kay)
 	ieee802_1x_cp_sm_deinit(sm);
 }
 
-/*
- * ABANDON must clear usingTransmitSA: the escape diverts around TRANSMITTING
- * (the only other place the flag is cleared), and a stale 'true' could enter
- * TRANSMITTING before the new transmit SA is installed.
- */
-static void test_abandon_clears_using_transmit_sa(struct ieee802_1x_kay *kay)
+/* A connectivity reset must not carry completion into the next attempt. */
+static void test_reset_clears_using_transmit_sa(struct ieee802_1x_kay *kay)
 {
 	struct ieee802_1x_cp_sm *sm = drive_to_transmit(kay);
 
-	printf("test: ABANDON clears usingTransmitSA\n");
+	printf("test: connectivity reset clears usingTransmitSA\n");
 	CHECK(sm != NULL, "CP SM initialised");
 	if (!sm)
 		return;
 	CHECK(sm->CP_state == CP_TRANSMIT, "precondition: CP is in CP_TRANSMIT");
 
-	/* Transmit SA asserted, then a new SAK lands in the same window: the CP
-	 * diverts CP_TRANSMIT -> ABANDON rather than -> TRANSMITTING. */
+	sm->connect = PENDING;
 	sm->using_transmit_sa = true;
 	sm->new_sak = true;
 	sm_CP_Step(sm);
 
 	printf("  after new SAK, state %s, usingTransmitSA=%d\n",
 	       cp_state_name(sm->CP_state), sm->using_transmit_sa);
-	CHECK(sm->CP_state == CP_ABANDON,
-	      "CP diverted CP_TRANSMIT -> ABANDON on new SAK");
+	CHECK(sm->CP_state == CP_CHANGE,
+	      "A real connectivity change resets CP");
 	CHECK(!sm->using_transmit_sa,
-	      "ABANDON cleared usingTransmitSA (no stale true into next cycle)");
+	      "Reset cleared usingTransmitSA (no stale true into next cycle)");
 
 	ieee802_1x_cp_sm_deinit(sm);
 }
@@ -251,9 +258,9 @@ int main(void)
 
 	memset(&kay, 0, sizeof(kay));
 
-	test_wedge_escapes_on_new_sak(&kay);
+	test_pending_selection_survives_new_sak(&kay);
 	test_healthy_path_reaches_transmitting(&kay);
-	test_abandon_clears_using_transmit_sa(&kay);
+	test_reset_clears_using_transmit_sa(&kay);
 
 	printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "PASSED",
 	       failures, failures == 1 ? "" : "s");

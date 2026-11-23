@@ -3,7 +3,7 @@ ALL=test-base64 test-md4 test-milenage \
 	test-sha1 \
 	test-https test-https_server \
 	test-sha256 test-aes test-x509v3 test-list test-rc4 \
-	test-macsec_cp_wedge
+	test-macsec_cp_wedge test-macsec_rollover
 
 include ../src/build.rules
 
@@ -48,8 +48,19 @@ LLIBS += -lrt
 
 # Self-contained MACsec CP regression test: #includes the CP module with
 # stubbed deps, needs no extra libraries.
-test-macsec_cp_wedge: test-macsec_cp_wedge.c
+test-macsec_cp_wedge: test-macsec_cp_wedge.c ../src/pae/ieee802_1x_cp.c
 	$(CC) $(CFLAGS) -o $@ $<
+
+MACSEC_ROLLOVER_SRCS = test-macsec_rollover.c \
+	../src/pae/ieee802_1x_secy_ops.c ../src/pae/ieee802_1x_key.c \
+	../src/utils/common.c ../src/utils/os_unix.c ../src/utils/wpa_debug.c \
+	../src/utils/wpabuf.c ../src/utils/eloop.c ../src/crypto/crypto_openssl.c
+
+test-macsec_rollover: $(MACSEC_ROLLOVER_SRCS) \
+	../src/pae/ieee802_1x_kay.c ../src/pae/ieee802_1x_cp.c
+	$(CC) $(CFLAGS) -DCONFIG_MACSEC -DCONFIG_OPENSSL_CMAC \
+		-Wno-deprecated-declarations -ffunction-sections -fdata-sections \
+		-Wl,--gc-sections $(LDFLAGS) -o $@ $(MACSEC_ROLLOVER_SRCS) -lcrypto
 
 test-aes: $(call BUILDOBJ,test-aes.o) $(LIBS)
 	$(LDO) $(LDFLAGS) -o $@ $^ $(LLIBS)
@@ -97,6 +108,7 @@ run-tests: $(ALL)
 	./test-sha1
 	./test-sha256
 	./test-macsec_cp_wedge
+	./test-macsec_rollover
 	@echo
 	@echo All tests completed successfully.
 

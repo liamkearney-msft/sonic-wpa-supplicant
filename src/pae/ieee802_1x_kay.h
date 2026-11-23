@@ -68,8 +68,7 @@ struct data_key {
 	struct ieee802_1x_mka_ki key_identifier;
 	enum confidentiality_offset confidentiality_offset;
 	u8 an;
-	bool transmits;
-	bool receives;
+	bool abandoned;
 	struct os_time created_time;
 	u64 next_pn;
 	u8 salt[SALT_LEN];
@@ -130,6 +129,13 @@ struct receive_sc {
 	 * primary over the same link, so it is created once and freed only when
 	 * the last CA drops its peer. */
 	int refcnt;
+
+	/* Authenticated port-key observations, independent of the reporting CA. */
+	struct ieee802_1x_mka_ki sak_ki[2];
+	u8 sak_an[2];
+	bool sak_rx[2];
+	bool sak_tx[2];
+	time_t sak_use_expire;
 
 	struct dl_list list;
 	struct dl_list sa_list;
@@ -211,9 +217,12 @@ struct ieee802_1x_kay {
 	enum confidentiality_offset macsec_confidentiality;
 	u32 mka_hello_time;
 
-	/* State of the single installed SAK in the SecY (one SecY per port),
-	 * reported by MKA in every SAK Use body. It belongs to the KaY, not to
-	 * a per-CA participant; the principal merely reports it. */
+	/* Installed keys and the in-flight proposal belong to the port, not
+	 * the CA that distributed them. Only the principal reports their use. */
+	struct dl_list sak_list;
+	struct data_key *new_key;
+	bool to_use_sak;
+
 	struct ieee802_1x_mka_ki lki;
 	u8 lan;
 	bool ltx;
@@ -251,9 +260,8 @@ struct ieee802_1x_kay {
 	struct dl_list participant_list;
 	enum macsec_policy policy;
 
-	/* The MKA that currently owns the CP state machine and the SecY (data
-	 * path) programming. An explicit pointer so the CP owner can be
-	 * switched atomically when a fallback CKN takes over. */
+	/* The CA authorized to negotiate the port's next SAK. Changing it
+	 * does not transfer or reset the port-wide key lifecycle. */
 	struct ieee802_1x_mka_participant *principal_participant;
 
 	/* Set when the principal changes, cleared when a deferred rekey is
@@ -321,6 +329,12 @@ int ieee802_1x_kay_enable_tx_sas(struct ieee802_1x_kay *kay,
 int ieee802_1x_kay_enable_rx_sas(struct ieee802_1x_kay *kay,
 				 struct ieee802_1x_mka_ki *lki);
 int ieee802_1x_kay_enable_new_info(struct ieee802_1x_kay *kay);
+bool ieee802_1x_kay_can_transmit_sak(struct ieee802_1x_kay *kay,
+				   const struct ieee802_1x_mka_ki *ki);
+bool ieee802_1x_kay_can_abandon_sak(struct ieee802_1x_kay *kay);
+void ieee802_1x_kay_abandon_sak(struct ieee802_1x_kay *kay,
+			       const struct ieee802_1x_mka_ki *ki);
+void ieee802_1x_kay_rekey_failed(struct ieee802_1x_kay *kay);
 int ieee802_1x_kay_get_status(struct ieee802_1x_kay *kay, char *buf,
 			      size_t buflen);
 int ieee802_1x_kay_get_macsec(struct ieee802_1x_kay *kay, char *buf,

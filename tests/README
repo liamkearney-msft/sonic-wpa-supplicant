@@ -8,6 +8,67 @@ hwsim directory contains the test setup for full system testing of
 wpa_supplicant and hostapd with a simulated radio (mac80211_hwsim). See
 hwsim/READM and hwsim/vm/README for more details.
 
+MACsec rollover regressions
+--------------------------
+
+make -C tests test-macsec_cp_wedge test-macsec_rollover
+tests/test-macsec_cp_wedge
+tests/test-macsec_rollover
+
+The rollover test compiles the production KaY, CP, SecY wrappers, key
+derivation, packet verification and event-loop code. Only packet transport
+and hardware callbacks are replaced. It requires the OpenSSL development
+library already used by OpenSSL-based wpa_supplicant builds.
+
+SAKs, including the in-flight proposal, belong to the port rather than a CA.
+A principal change preserves their identities, ANs, packet numbers and CP
+phase. One local proposal is allowed at a time; missing DistSAKs are
+retransmitted with the same identity, and occupied ANs are never predicted
+to become free. A new negotiating actor cannot reissue another actor's KI.
+Fresh key-use observations belong to the peer's shared receive SCI, so
+removing the CA that carried a report does not destroy that evidence.
+Absent or empty standby reports neither erase nor extend its lifetime.
+
+TX selection requires fresh, full-KI-and-AN-matched RX readiness from every
+live principal peer, including at initial establishment. Peer TX may still
+use the old key. Neither the transmit deadline nor a disabled controlled
+port substitutes for readiness. The normal transmit deadline instead permits
+safe abandonment of an unreceived proposal while retaining the current TX SA.
+The key server keeps a fresh-distribution request pending until the abandoned
+candidate has drained and its slot is released.
+
+Pre-TX recovery uses the existing ABANDON state. Fresh reports must show that
+every live principal peer can receive the retained key and that none
+transmits the candidate before an inherited proposal is abandoned. After
+withdrawal the proposal cannot be redistributed, even if its originating
+CA becomes principal again while RX is draining. Candidate RX remains
+installed for the normal drain delay, and deletion requires fresh evidence.
+Once TX selection is requested, neither an acknowledgment delay nor a driver
+error makes the candidate safe to abandon: hardware programming may already
+be queued. The candidate is preserved across principal changes; CP never
+selects the previous TX SA again. Unconfirmed TX selection is bounded by an
+explicit timeout and controlled-port restart, not rollback.
+Unresolved pre-TX recovery
+is bounded by the existing retirement failsafe and explicitly restarts
+negotiation with the controlled port closed; it does not fabricate success.
+If every peer instead commits to the candidate during recovery, CP selects
+that existing TX SA and completes the rollover without resetting its PN.
+
+Only the principal sends SAK Use. Other CAs stay live through authenticated,
+replay-checked recent MI/MN echoes; omitted standby SAK Use is not a peer
+failure. Missing principal SAK Use requests bounded key-progress repair
+without pretending that an authenticated, responsive peer has disappeared.
+
+Cases cover missed-DistSAK readiness, pre-TX recovery, forward-only TX,
+queued selection and activation errors, RX drain and its deadline,
+same-candidate retransmission, originating-CA deletion, overlapping incoming
+SAKs, occupied ANs, failed activation, signed SAK-Use omission, stale echoes,
+replay, invalid ICVs, and matching a full KI in either peer key-use slot.
+These are offline regressions, not hardware completion or lossless-data-path
+qualification. SONiC driver wait/acknowledgment semantics are unchanged.
+If fresh peer RX readiness is unavailable, CP does not request candidate TX.
+Missing SAK Use is neither readiness nor proof that an installed key is unused.
+
 
 Build testing
 -------------

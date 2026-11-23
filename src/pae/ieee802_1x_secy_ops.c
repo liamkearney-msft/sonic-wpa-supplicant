@@ -320,6 +320,7 @@ int secy_delete_receive_sa(struct ieee802_1x_kay *kay, struct receive_sa *rxsa)
 int secy_enable_receive_sa(struct ieee802_1x_kay *kay, struct receive_sa *rxsa)
 {
 	struct ieee802_1x_kay_ctx *ops;
+	int ret;
 
 	if (!kay || !rxsa) {
 		wpa_printf(MSG_ERROR, "KaY: %s params invalid", __func__);
@@ -333,9 +334,10 @@ int secy_enable_receive_sa(struct ieee802_1x_kay *kay, struct receive_sa *rxsa)
 		return -1;
 	}
 
-	rxsa->enable_receive = true;
-
-	return ops->enable_receive_sa(ops->ctx, rxsa);
+	ret = ops->enable_receive_sa(ops->ctx, rxsa);
+	if (!ret)
+		rxsa->enable_receive = true;
+	return ret;
 }
 
 
@@ -449,6 +451,7 @@ int secy_enable_transmit_sa(struct ieee802_1x_kay *kay,
 			    struct transmit_sa *txsa)
 {
 	struct ieee802_1x_kay_ctx *ops;
+	int ret;
 
 	if (!kay || !txsa) {
 		wpa_printf(MSG_ERROR, "KaY: %s params invalid", __func__);
@@ -462,9 +465,10 @@ int secy_enable_transmit_sa(struct ieee802_1x_kay *kay,
 		return -1;
 	}
 
-	txsa->enable_transmit = true;
-
-	return ops->enable_transmit_sa(ops->ctx, txsa);
+	ret = ops->enable_transmit_sa(ops->ctx, txsa);
+	if (!ret)
+		txsa->enable_transmit = true;
+	return ret;
 }
 
 
