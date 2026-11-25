@@ -95,7 +95,9 @@ void ieee802_1x_kay_abandon_sak(struct ieee802_1x_kay *kay,
 void ieee802_1x_kay_rekey_failed(struct ieee802_1x_kay *kay)
 { (void) kay; }
 
-/* eloop: no-ops. The test drives the SM synchronously; no timers needed. */
+static bool fail_timeout;
+
+/* The test drives the SM synchronously; no real timers are needed. */
 int eloop_cancel_timeout(eloop_timeout_handler handler, void *eloop_data,
 			 void *user_data)
 { (void) handler; (void) eloop_data; (void) user_data; return 0; }
@@ -103,7 +105,7 @@ int eloop_register_timeout(unsigned int secs, unsigned int usecs,
 			   eloop_timeout_handler handler, void *eloop_data,
 			   void *user_data)
 { (void) secs; (void) usecs; (void) handler; (void) eloop_data;
-  (void) user_data; return 0; }
+  (void) user_data; return fail_timeout ? -1 : 0; }
 
 /* ------------------------------------------------------------------ *
  * Module under test (brings in the static CP struct, states and step).
@@ -252,6 +254,24 @@ static void test_reset_clears_using_transmit_sa(struct ieee802_1x_kay *kay)
 	ieee802_1x_cp_sm_deinit(sm);
 }
 
+static void test_failed_drain_timer(struct ieee802_1x_kay *kay)
+{
+	struct ieee802_1x_cp_sm *sm = drive_to_transmit(kay);
+
+	printf("test: failed old RX drain timer closes the controlled port\n");
+	CHECK(sm != NULL, "CP SM initialised");
+	if (!sm)
+		return;
+	sm->orx = true;
+	sm->using_transmit_sa = true;
+	fail_timeout = true;
+	sm_CP_Step(sm);
+	fail_timeout = false;
+	CHECK(sm->CP_state == CP_CHANGE && !sm->controlled_port_enabled,
+	      "Timer failure resets explicitly instead of wedging retirement");
+	ieee802_1x_cp_sm_deinit(sm);
+}
+
 int main(void)
 {
 	struct ieee802_1x_kay kay;
@@ -261,6 +281,7 @@ int main(void)
 	test_pending_selection_survives_new_sak(&kay);
 	test_healthy_path_reaches_transmitting(&kay);
 	test_reset_clears_using_transmit_sa(&kay);
+	test_failed_drain_timer(&kay);
 
 	printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "PASSED",
 	       failures, failures == 1 ? "" : "s");

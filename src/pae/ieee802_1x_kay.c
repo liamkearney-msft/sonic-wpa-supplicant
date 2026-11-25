@@ -742,6 +742,20 @@ ieee802_1x_kay_find_receive_sc(struct ieee802_1x_kay *kay,
 }
 
 
+static bool
+ieee802_1x_kay_sci_has_sas(struct ieee802_1x_kay *kay,
+			 const struct ieee802_1x_mka_sci *sci)
+{
+	struct receive_sc *rxsc;
+
+	if (kay->txsc && sci_equal(&kay->txsc->sci, sci) &&
+	    !dl_list_empty(&kay->txsc->sa_list))
+		return true;
+	rxsc = ieee802_1x_kay_find_receive_sc(kay, sci);
+	return rxsc && !dl_list_empty(&rxsc->sa_list);
+}
+
+
 /**
  * ieee802_1x_kay_ref_receive_sc - Reference (find-or-create) a receive SC
  *
@@ -1957,6 +1971,7 @@ ieee802_1x_mka_decode_dist_sak_body(
 	u8 *wrap_sak;
 	u8 *unwrap_sak;
 	struct ieee802_1x_kay *kay = participant->kay;
+	bool chgd_server;
 
 	hdr = (struct ieee802_1x_mka_hdr *) mka_msg;
 	body_len = get_mka_param_body_len(hdr);
@@ -2088,9 +2103,14 @@ ieee802_1x_mka_decode_dist_sak_body(
 		ieee802_1x_kay_elect_key_server(participant, true);
 	}
 	participant->advised_desired = true;
-	if (ieee802_1x_kay_sak_pending(kay) ||
-	    (ieee802_1x_kay_ki_is_set(&kay->oki) && body->dan == kay->oan &&
-	     cs->id == kay->macsec_cs_id)) {
+	/* 802.1X-2020: chgdServer follows distribution, not election. */
+	chgd_server = !ieee802_1x_kay_sci_has_sas(kay, &peer->sci);
+	/* A queued proposal must reach CP before another can replace it. */
+	if ((ieee802_1x_kay_sak_pending(kay) &&
+	     (!chgd_server || !kay->new_key ||
+	      !is_ki_equal(&kay->new_key->key_identifier, &kay->lki))) ||
+	    (!chgd_server && ieee802_1x_kay_ki_is_set(&kay->oki) &&
+	     body->dan == kay->oan && cs->id == kay->macsec_cs_id)) {
 		if (!ieee802_1x_kay_can_transmit_sak(kay, &kay->lki) &&
 		    ieee802_1x_kay_can_abandon_sak(kay))
 			ieee802_1x_cp_abandon_sak(kay->cp);
@@ -2136,6 +2156,8 @@ ieee802_1x_mka_decode_dist_sak_body(
 	ieee802_1x_cp_sm_step(kay->cp);
 	ieee802_1x_cp_set_offset(kay->cp, body->confid_offset);
 	ieee802_1x_cp_sm_step(kay->cp);
+	if (chgd_server)
+		ieee802_1x_cp_signal_chgdserver(kay->cp);
 	ieee802_1x_cp_set_distributedki(kay->cp, &sa_key->key_identifier);
 	ieee802_1x_cp_set_distributedan(kay->cp, body->dan);
 	ieee802_1x_cp_signal_newsak(kay->cp);
@@ -2759,6 +2781,8 @@ ieee802_1x_kay_generate_new_sak(struct ieee802_1x_mka_participant *participant)
 	}
 	ieee802_1x_kay_init_data_key(sa_key);
 
+	if (!ieee802_1x_kay_sci_has_sas(kay, &kay->actor_sci))
+		ieee802_1x_cp_signal_chgdserver(kay->cp);
 	kay->new_key = sa_key;
 
 	ieee802_1x_kay_use_data_key(sa_key);
@@ -2939,10 +2963,6 @@ ieee802_1x_kay_elect_key_server(struct ieee802_1x_mka_participant *participant,
 
 	if (i_is_key_server) {
 		ieee802_1x_cp_set_electedself(kay->cp, true);
-		if (!sci_equal(&kay->key_server_sci, &kay->actor_sci)) {
-			ieee802_1x_cp_signal_chgdserver(kay->cp);
-			ieee802_1x_cp_sm_step(kay->cp);
-		}
 
 		/* Defer a handover with a retained SAK, preserving any pending
 		 * settle window. Ordinary peer elections need no new window. */
@@ -2963,10 +2983,6 @@ ieee802_1x_kay_elect_key_server(struct ieee802_1x_mka_participant *participant,
 			   "KaY: Peer %s was elected as the key server",
 			   mi_txt(key_server->mi));
 		ieee802_1x_cp_set_electedself(kay->cp, false);
-		if (!sci_equal(&kay->key_server_sci, &key_server->sci)) {
-			ieee802_1x_cp_signal_chgdserver(kay->cp);
-			ieee802_1x_cp_sm_step(kay->cp);
-		}
 
 		os_memcpy(&kay->key_server_sci, &key_server->sci,
 			  sizeof(kay->key_server_sci));

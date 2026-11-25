@@ -500,6 +500,89 @@ static void test_tx_point_of_no_return(void)
 	puts("PASS: queued and committed TX survive handover without old-TX reselection");
 }
 
+static void test_old_rx_drain(void)
+{
+	struct fixture f;
+	struct ieee802_1x_cp_sm *sm;
+	struct os_reltime start, end, elapsed;
+	unsigned int role, deletes, selections;
+
+	for (role = 0; role < 2; role++) {
+		init_fixture(&f, true);
+		sm = f.kay.cp;
+		sm->elected_self = f.p[0]->is_key_server = role == 0;
+		first_peer(f.p[0])->is_key_server = role != 0;
+		observe_old(&f, 0, true);
+		assert(!os_get_reltime(&start));
+		ieee802_1x_kay_update_sak_use(f.p[0]);
+		ieee802_1x_cp_step_run(sm);
+		assert(sm->CP_state == CP_TRANSMITTING && f.selected_an == 1);
+		assert(sm->retire_when == 3000);
+		deletes = f.deletes;
+		selections = f.selections;
+		ieee802_1x_kay_update_sak_use(f.p[0]);
+		assert(sm->all_transmitting);
+		ieee802_1x_cp_step_run(sm);
+		sm->new_sak = true;
+		ieee802_1x_cp_step_run(sm);
+		assert(sm->CP_state == CP_TRANSMITTING);
+		assert(f.deletes == deletes);
+		assert(lookup_rxsa_by_an(peer_sc(f.p[0]), 0));
+		sm->new_sak = false;
+
+		eloop_run();
+		assert(!os_get_reltime(&end));
+		os_reltime_sub(&end, &start, &elapsed);
+		assert(elapsed.sec >= 3);
+		assert(sm->CP_state == CP_RETIRE && f.kay.oki.kn == 2);
+		assert(!lookup_rxsa_by_an(peer_sc(f.p[0]), 0));
+		assert(f.deletes == deletes + 2 && f.selections == selections);
+		assert(!sm->retire_when && f.selected_an == 1);
+		deinit_fixture(&f);
+	}
+	puts("PASS: server and follower retain old RX for three seconds despite peer TX and new SAK");
+}
+
+static void test_ready_role_change(void)
+{
+	struct fixture f;
+	struct ieee802_1x_cp_sm *sm;
+	unsigned int ready, deletes, selections;
+
+	for (ready = 0; ready < 2; ready++) {
+		init_fixture(&f, true);
+		sm = f.kay.cp;
+		f.p[0]->can_be_key_server = false;
+		first_peer(f.p[0])->is_key_server = true;
+		assert(!ieee802_1x_kay_elect_key_server(f.p[0], false));
+		ieee802_1x_cp_step_run(sm);
+		assert(sm->CP_state == CP_READY && f.selected_an == 0);
+		observe_old(&f, 0, false);
+		peer_sc(f.p[0])->sak_rx[1] = ready;
+		ieee802_1x_kay_update_sak_use(f.p[0]);
+		ieee802_1x_cp_step_run(sm);
+		assert(sm->CP_state == CP_READY && !sm->server_transmitting);
+		deletes = f.deletes;
+		selections = f.selections;
+
+		f.p[0]->can_be_key_server = true;
+		assert(!ieee802_1x_kay_elect_key_server(f.p[0], false));
+		ieee802_1x_cp_step_run(sm);
+		if (ready) {
+			assert(sm->CP_state == CP_TRANSMITTING);
+			assert(f.selected_an == 1 && f.selections == selections + 1);
+		} else {
+			assert(sm->CP_state == CP_READY && f.selected_an == 0);
+			ieee802_1x_cp_transmit_when_timeout(sm, NULL);
+			assert(sm->CP_state == CP_ABANDON);
+			assert(f.selected_an == 0 && f.selections == selections);
+		}
+		assert(f.deletes == deletes && f.kay.new_key == f.candidate);
+		deinit_fixture(&f);
+	}
+	puts("PASS: a promoted READY actor uses fresh RX readiness, never the former server's TX flag");
+}
+
 static void test_shared_recovery(void)
 {
 	struct fixture f;
@@ -613,6 +696,8 @@ static void test_pre_tx_and_bounds(void)
 	assert(sm->CP_state == CP_TRANSMITTING && f.selected_an == 1);
 	ieee802_1x_kay_update_sak_use(f.p[0]);
 	ieee802_1x_cp_step_run(sm);
+	assert(sm->CP_state == CP_TRANSMITTING && f.selected_an == 1);
+	ieee802_1x_cp_retire_when_timeout(sm, NULL);
 	assert(sm->CP_state == CP_RETIRE && f.selected_an == 1);
 	assert(f.kay.oki.kn == 2 && !f.kay.lki.kn);
 	deinit_fixture(&f);
@@ -712,6 +797,8 @@ static void test_incoming_distribution(void)
 	assert(!sm->new_sak && f.kay.lki.kn == 2);
 	sm->all_transmitting = true;
 	ieee802_1x_cp_step_run(sm);
+	assert(sm->CP_state == CP_TRANSMITTING && f.kay.oki.kn == 1);
+	ieee802_1x_cp_retire_when_timeout(sm, NULL);
 	assert(sm->CP_state == CP_RETIRE && f.kay.oki.kn == 2);
 	assert(!ieee802_1x_mka_decode_dist_sak_body(f.p[0], raw, sizeof(raw)));
 	assert(f.kay.new_key->key_identifier.kn == 77);
@@ -720,6 +807,112 @@ static void test_incoming_distribution(void)
 	assert(dl_list_len(&f.kay.sak_list) == 2);
 	deinit_fixture(&f);
 	puts("PASS: incoming overlap is deferred; a repeated full KI is idempotent");
+}
+
+static void test_server_election_and_distribution(void)
+{
+	struct fixture f;
+	struct ieee802_1x_cp_sm *sm;
+	struct ieee802_1x_kay_peer *peer;
+	struct transmit_sa *old_tx;
+	u8 raw[sizeof(struct ieee802_1x_mka_dist_sak_body) + 24] = { 0 };
+	struct ieee802_1x_mka_dist_sak_body *body = (void *) raw;
+	u8 sak[16] = { 7 };
+	unsigned int i, creates, deletes, selections;
+
+	for (i = 0; i < 4; i++) {
+		init_fixture(&f, i & 1);
+		sm = f.kay.cp;
+		if (i & 1)
+			commit_transmit(&f);
+		old_tx = lookup_txsa_by_an(f.kay.txsc, 0);
+		old_tx->next_pn = 777;
+		creates = f.creates;
+		deletes = f.deletes;
+		selections = f.selections;
+		peer = first_peer(f.p[0]);
+		if (i >= 2) {
+			ieee802_1x_kay_deref_receive_sc(&f.kay, &peer->sci);
+			peer->sci.addr[5] = 3;
+			assert(!ieee802_1x_kay_ref_receive_sc(&f.kay, &peer->sci));
+			assert(dl_list_empty(&peer_sc(f.p[0])->sa_list));
+		}
+		f.p[0]->is_key_server = f.p[0]->can_be_key_server = false;
+		peer->is_key_server = true;
+		assert(!ieee802_1x_kay_elect_key_server(f.p[0], false));
+		ieee802_1x_cp_step_run(sm);
+		assert(!sm->chgd_server && !sm->elected_self);
+		assert(f.creates == creates && f.deletes == deletes);
+		assert(old_tx == lookup_txsa_by_an(f.kay.txsc, 0));
+		assert(old_tx->next_pn == 777 && f.selections == selections);
+		assert(f.kay.oki.kn == 1 && f.kay.lki.kn == (i & 1 ? 2 : 0));
+
+		f.p[0]->can_be_key_server = true;
+		assert(!ieee802_1x_kay_elect_key_server(f.p[0], false));
+		ieee802_1x_cp_step_run(sm);
+		assert(sm->elected_self && !sm->chgd_server);
+		assert(f.deletes == deletes && f.selections == selections);
+		f.p[0]->can_be_key_server = false;
+		assert(!ieee802_1x_kay_elect_key_server(f.p[0], false));
+
+		body->type = MKA_DISTRIBUTED_SAK;
+		body->dan = i == 0 ? 1 : 0;
+		body->confid_offset = CONFIDENTIALITY_NONE;
+		body->kn = host_to_be32(77);
+		set_mka_param_body_len(body, 28);
+		assert(!aes_wrap(f.p[0]->kek.key, f.p[0]->kek.len, 2,
+				sak, body->sak));
+		body->sak[0] ^= 1;
+		assert(ieee802_1x_mka_decode_dist_sak_body(f.p[0], raw,
+							 sizeof(raw)) < 0);
+		ieee802_1x_cp_step_run(sm);
+		assert(!sm->chgd_server && f.deletes == deletes);
+		body->sak[0] ^= 1;
+		assert(!ieee802_1x_mka_decode_dist_sak_body(f.p[0], raw,
+							  sizeof(raw)));
+		if (i >= 2) {
+			body->kn = host_to_be32(78);
+			assert(!ieee802_1x_mka_decode_dist_sak_body(f.p[0], raw,
+								  sizeof(raw)));
+			assert(f.kay.new_key->key_identifier.kn == 77);
+			assert(dl_list_len(&f.kay.sak_list) == (i & 1 ? 3 : 2));
+			body->kn = host_to_be32(77);
+		}
+		if (i == 1) {
+			assert(!sm->chgd_server && !sm->new_sak);
+			assert(f.kay.lki.kn == 2 && f.deletes == deletes);
+			ieee802_1x_cp_retire_when_timeout(sm, NULL);
+			assert(f.kay.oki.kn == 2 && f.deletes == deletes + 2);
+			assert(!ieee802_1x_mka_decode_dist_sak_body(f.p[0], raw,
+								  sizeof(raw)));
+		}
+		assert(sm->chgd_server == (i >= 2));
+		ieee802_1x_cp_step_run(sm);
+		assert(sm->CP_state == CP_READY && f.kay.lki.kn == 77);
+		assert(!os_memcmp(f.kay.lki.mi, peer->mi, MI_LEN));
+		if (i >= 2) {
+			assert(!f.kay.oki.kn && !sm->controlled_port_enabled);
+			assert(f.deletes == deletes + (i & 1 ? 4 : 2));
+		} else {
+			assert(f.kay.oki.kn == (i == 0 ? 1 : 2));
+			assert(sm->controlled_port_enabled);
+		}
+		assert(f.selections == selections);
+		if (i == 0) {
+			f.candidate = f.kay.new_key;
+			observe_old(&f, 0, false);
+			f.p[0]->can_be_key_server = true;
+			assert(!ieee802_1x_kay_elect_key_server(f.p[0], false));
+			ieee802_1x_kay_update_sak_use(f.p[0]);
+			ieee802_1x_cp_step_run(sm);
+			assert(sm->CP_state == CP_TRANSMITTING && f.selected_an == 1);
+			assert(f.selections == selections + 1 && f.deletes == deletes);
+			assert(f.kay.new_key == f.candidate);
+			assert(!f.p[0]->to_dist_sak && old_tx->next_pn == 777);
+		}
+		deinit_fixture(&f);
+	}
+	puts("PASS: election preserves SAs; only valid distribution from a new SCI resets CP");
 }
 
 static void test_backend_errors_and_occupied_an(void)
@@ -921,6 +1114,9 @@ int main(void)
 	test_fresh_readiness_at_selection();
 	test_missed_distribution_failover();
 	test_tx_point_of_no_return();
+	test_server_election_and_distribution();
+	test_old_rx_drain();
+	test_ready_role_change();
 	test_shared_recovery();
 	test_pre_tx_and_bounds();
 	test_lost_distribution_and_teardown();

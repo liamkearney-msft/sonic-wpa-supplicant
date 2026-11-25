@@ -339,21 +339,20 @@ SM_STATE(CP, TRANSMITTING)
 {
 	SM_ENTRY(CP, TRANSMITTING);
 	eloop_cancel_timeout(ieee802_1x_cp_transmit_when_timeout, sm, NULL);
-	/* The key server holds the old SA until every live peer has moved its
-	 * transmit to the new SAK (the all_transmitting gate in SM_STEP), so
-	 * retire_when is only a long failsafe for a live peer that never
-	 * confirms. A non key server cannot observe all_transmitting and keeps
-	 * the stock short timer. */
-	sm->retire_when = sm->orx ?
-		(sm->elected_self ? MKA_SAK_RETIRE_FAILSAFE_TIME :
-		 sm->retire_delay) : 0;
+	/* Peer TX reports do not drain old-key frames already in flight. */
+	sm->retire_when = sm->orx ? sm->retire_delay : 0;
 	sm->otx = false;
 	ieee802_1x_kay_set_old_sa_attr(sm->kay, sm->oki, sm->oan,
 				       sm->otx, sm->orx);
 	ieee802_1x_kay_enable_new_info(sm->kay);
 	eloop_cancel_timeout(ieee802_1x_cp_retire_when_timeout, sm, NULL);
-	eloop_register_timeout(sm->retire_when / 1000, 0,
-			       ieee802_1x_cp_retire_when_timeout, sm, NULL);
+	if (sm->retire_when &&
+	    eloop_register_timeout(sm->retire_when / 1000, 0,
+				   ieee802_1x_cp_retire_when_timeout, sm, NULL)) {
+		wpa_printf(MSG_ERROR, "CP: Could not arm old RX drain timeout");
+		SM_ENTER(CP, CHANGE);
+		ieee802_1x_kay_rekey_failed(sm->kay);
+	}
 	sm->using_transmit_sa = false;
 }
 
@@ -484,10 +483,7 @@ SM_STEP(CP)
 		break;
 
 	case CP_TRANSMITTING:
-		/* Local proposals are serialized; a peer-originated proposal
-		 * still needs an exit to RECEIVE. */
-		if (sm->all_transmitting || !sm->retire_when || sm->new_sak ||
-		    changed_connect(sm))
+		if (!sm->retire_when || changed_connect(sm))
 			SM_ENTER(CP, RETIRE);
 		break;
 
@@ -499,13 +495,17 @@ SM_STEP(CP)
 		break;
 
 	case CP_READY:
+		/* A follower can become key server without replacing its SAK. */
 		if (changed_connect(sm))
 			SM_ENTER(CP, CHANGE);
 		else if (sm->new_sak)
 			ieee802_1x_cp_abandon_sak(sm);
-		else if (sm->server_transmitting &&
+		else if ((sm->elected_self || sm->server_transmitting) &&
 			 ieee802_1x_kay_can_transmit_sak(sm->kay, sm->lki))
 			SM_ENTER(CP, TRANSMIT);
+		else if (sm->elected_self && !sm->transmit_when &&
+			 ieee802_1x_kay_can_abandon_sak(sm->kay))
+			ieee802_1x_cp_abandon_sak(sm);
 		break;
 	case CP_ABANDON:
 		if (changed_connect(sm))
