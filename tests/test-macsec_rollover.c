@@ -32,7 +32,7 @@ struct fixture {
 	int selected_an, fail_an;
 	int abandon_result;
 	bool fail_rx, fail_after_select, abandon_during_select;
-	bool expire_before_select;
+	bool expire_before_select, clear_peer_tx_after_select;
 };
 
 static struct receive_sc *peer_sc(struct ieee802_1x_mka_participant *p);
@@ -128,6 +128,12 @@ static int enable_tx(void *ctx, struct transmit_sa *sa)
 		return -1;
 	f->selected_an = sa->an;
 	f->selections++;
+	if (f->clear_peer_tx_after_select && sa->an == 1) {
+		struct receive_sc *sc = peer_sc(f->kay.principal_participant);
+
+		sc->sak_tx[0] = sc->sak_tx[1] = false;
+		f->clear_peer_tx_after_select = false;
+	}
 	return f->fail_an == sa->an ? -1 : 0;
 }
 
@@ -429,7 +435,7 @@ static void test_fresh_readiness_at_selection(void)
 	observe_old(&f, 0, true);
 	ieee802_1x_kay_update_sak_use(f.p[0]);
 	ieee802_1x_cp_step_run(sm);
-	assert(sm->CP_state == CP_TRANSMITTING && f.selected_an == 1);
+	assert(sm->CP_state == CP_RETIRE && f.selected_an == 1);
 	deinit_fixture(&f);
 	puts("PASS: stale flags, wrong KI/AN and closed-port startup cannot bypass RX readiness");
 }
@@ -500,7 +506,111 @@ static void test_tx_point_of_no_return(void)
 	puts("PASS: queued and committed TX survive handover without old-TX reselection");
 }
 
-static void test_old_rx_drain(void)
+static void start_waiting_for_peer_tx(struct fixture *f, unsigned int role)
+{
+	struct ieee802_1x_cp_sm *sm;
+
+	init_fixture(f, true);
+	sm = f->kay.cp;
+	sm->elected_self = f->p[0]->is_key_server = role == 0;
+	first_peer(f->p[0])->is_key_server = role != 0;
+	observe_old(f, 0, role != 0);
+	/* A follower's earlier server-TX report may change before its own
+	 * asynchronous TX selection completes. Retirement must recheck it. */
+	f->clear_peer_tx_after_select = role != 0;
+	ieee802_1x_kay_update_sak_use(f->p[0]);
+	ieee802_1x_cp_step_run(sm);
+	assert(sm->CP_state == CP_TRANSMITTING && f->selected_an == 1);
+	assert(lookup_rxsa_by_an(peer_sc(f->p[0]), 0));
+}
+
+static void test_peer_tx_retirement(void)
+{
+	struct fixture f;
+	struct ieee802_1x_cp_sm *sm;
+	struct receive_sc *sc, other_sc;
+	struct ieee802_1x_kay_peer other;
+	unsigned int role, mismatch, deletes, selections;
+
+	for (role = 0; role < 2; role++) {
+		start_waiting_for_peer_tx(&f, role);
+		sm = f.kay.cp;
+		sc = peer_sc(f.p[0]);
+		assert(sm->retire_when == 20000);
+		deletes = f.deletes;
+		selections = f.selections;
+		sm->all_transmitting = true;
+		sm->new_sak = true;
+		ieee802_1x_cp_step_run(sm);
+		assert(sm->CP_state == CP_TRANSMITTING && f.deletes == deletes);
+		assert(lookup_rxsa_by_an(peer_sc(f.p[0]), 0));
+		sm->new_sak = false;
+
+		for (mismatch = 0; mismatch < 5; mismatch++) {
+			observe_old(&f, 0, true);
+			switch (mismatch) {
+			case 0:
+				sc->sak_ki[1].mi[0] ^= 1;
+				break;
+			case 1:
+				sc->sak_ki[1].kn++;
+				break;
+			case 2:
+				sc->sak_an[1] = 0;
+				break;
+			case 3:
+				sc->sak_use_expire = time(NULL) - 1;
+				break;
+			case 4:
+				sc->sak_use_expire = 0;
+				break;
+			}
+			ieee802_1x_cp_step_run(sm);
+			assert(sm->CP_state == CP_TRANSMITTING);
+			assert(f.deletes == deletes && f.selections == selections);
+			assert(lookup_rxsa_by_an(sc, 0));
+		}
+
+		observe_old(&f, 0, true);
+		other = *first_peer(f.p[0]);
+		other_sc = *sc;
+		other_sc.sci.addr[5] = 3;
+		other.sci = other_sc.sci;
+		other_sc.sak_tx[1] = false;
+		dl_list_init(&other_sc.sa_list);
+		dl_list_add(&f.kay.rxsc_list, &other_sc.list);
+		dl_list_add(&f.p[0]->live_peers, &other.list);
+		ieee802_1x_kay_update_sak_use(f.p[0]);
+		ieee802_1x_cp_step_run(sm);
+		assert(sm->CP_state == CP_TRANSMITTING && f.deletes == deletes);
+		other_sc.sak_tx[1] = true;
+		ieee802_1x_kay_update_sak_use(f.p[0]);
+		ieee802_1x_cp_step_run(sm);
+		assert(sm->CP_state == CP_RETIRE && f.kay.oki.kn == 2);
+		assert(!lookup_rxsa_by_an(peer_sc(f.p[0]), 0));
+		assert(f.deletes == deletes + 2 && f.selections == selections);
+		dl_list_del(&other.list);
+		dl_list_del(&other_sc.list);
+		deinit_fixture(&f);
+	}
+	puts("PASS: both roles retain old RX until every peer freshly reports TX with the exact new KI/AN");
+}
+
+static void check_waiting_after_three_seconds(void *eloop_ctx, void *timeout_ctx)
+{
+	struct fixture *f = eloop_ctx;
+	struct ieee802_1x_cp_sm *sm = f->kay.cp;
+
+	assert(sm->CP_state == CP_TRANSMITTING);
+	assert(lookup_rxsa_by_an(peer_sc(f->p[0]), 0));
+	sm->all_transmitting = sm->new_sak = true;
+	ieee802_1x_cp_step_run(sm);
+	assert(sm->CP_state == CP_TRANSMITTING);
+	assert(lookup_rxsa_by_an(peer_sc(f->p[0]), 0));
+	sm->new_sak = false;
+}
+
+static void test_peer_tx_retirement_timeout(void)
 {
 	struct fixture f;
 	struct ieee802_1x_cp_sm *sm;
@@ -508,39 +618,25 @@ static void test_old_rx_drain(void)
 	unsigned int role, deletes, selections;
 
 	for (role = 0; role < 2; role++) {
-		init_fixture(&f, true);
-		sm = f.kay.cp;
-		sm->elected_self = f.p[0]->is_key_server = role == 0;
-		first_peer(f.p[0])->is_key_server = role != 0;
-		observe_old(&f, 0, true);
 		assert(!os_get_reltime(&start));
-		ieee802_1x_kay_update_sak_use(f.p[0]);
-		ieee802_1x_cp_step_run(sm);
-		assert(sm->CP_state == CP_TRANSMITTING && f.selected_an == 1);
-		assert(sm->retire_when == 3000);
+		start_waiting_for_peer_tx(&f, role);
+		sm = f.kay.cp;
 		deletes = f.deletes;
 		selections = f.selections;
-		ieee802_1x_kay_update_sak_use(f.p[0]);
-		assert(sm->all_transmitting);
-		ieee802_1x_cp_step_run(sm);
-		sm->new_sak = true;
-		ieee802_1x_cp_step_run(sm);
-		assert(sm->CP_state == CP_TRANSMITTING);
-		assert(f.deletes == deletes);
-		assert(lookup_rxsa_by_an(peer_sc(f.p[0]), 0));
-		sm->new_sak = false;
-
+		assert(!eloop_register_timeout(3, 100000,
+					      check_waiting_after_three_seconds,
+					      &f, NULL));
 		eloop_run();
 		assert(!os_get_reltime(&end));
 		os_reltime_sub(&end, &start, &elapsed);
-		assert(elapsed.sec >= 3);
+		assert(elapsed.sec >= 20);
 		assert(sm->CP_state == CP_RETIRE && f.kay.oki.kn == 2);
 		assert(!lookup_rxsa_by_an(peer_sc(f.p[0]), 0));
 		assert(f.deletes == deletes + 2 && f.selections == selections);
-		assert(!sm->retire_when && f.selected_an == 1);
+		assert(f.selected_an == 1);
 		deinit_fixture(&f);
 	}
-	puts("PASS: server and follower retain old RX for three seconds despite peer TX and new SAK");
+	puts("PASS: missing peer TX reports preserve old RX beyond three seconds and retire at the 20-second deadline");
 }
 
 static void test_ready_role_change(void)
@@ -693,11 +789,9 @@ static void test_pre_tx_and_bounds(void)
 	observe_old(&f, 0, true);
 	ieee802_1x_kay_update_sak_use(f.p[0]);
 	ieee802_1x_cp_step_run(sm);
-	assert(sm->CP_state == CP_TRANSMITTING && f.selected_an == 1);
+	assert(sm->CP_state == CP_RETIRE && f.selected_an == 1);
 	ieee802_1x_kay_update_sak_use(f.p[0]);
 	ieee802_1x_cp_step_run(sm);
-	assert(sm->CP_state == CP_TRANSMITTING && f.selected_an == 1);
-	ieee802_1x_cp_retire_when_timeout(sm, NULL);
 	assert(sm->CP_state == CP_RETIRE && f.selected_an == 1);
 	assert(f.kay.oki.kn == 2 && !f.kay.lki.kn);
 	deinit_fixture(&f);
@@ -1115,7 +1209,8 @@ int main(void)
 	test_missed_distribution_failover();
 	test_tx_point_of_no_return();
 	test_server_election_and_distribution();
-	test_old_rx_drain();
+	test_peer_tx_retirement();
+	test_peer_tx_retirement_timeout();
 	test_ready_role_change();
 	test_shared_recovery();
 	test_pre_tx_and_bounds();

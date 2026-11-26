@@ -49,10 +49,14 @@ be queued. The candidate is preserved across principal changes; CP never
 selects the previous TX SA again. Unconfirmed TX selection is bounded by an
 explicit timeout and controlled-port restart, not rollback.
 
-After TX completes, both key server and follower retain old RX for the
-three-second retirement delay. Peer TX reports and a queued replacement
-cannot shorten this drain. Failure to arm it explicitly closes the
-controlled port and restarts negotiation.
+After TX completes, both key server and follower retain old RX until every
+live principal peer freshly reports TX with the exact new KI and AN.
+RX readiness alone, stale reports and a queued replacement cannot retire
+the old key. A twenty-second failsafe retires it with an explicit warning
+if TX confirmation never arrives; this escape is not guaranteed hitless.
+Failure to arm the timeout explicitly closes the controlled port and
+restarts negotiation. The three-second drain still applies to abandoned
+pre-TX candidates, not to normal old-key retirement.
 
 Changing the elected key server does not reset installed or in-flight SAs.
 CP's chgdServer signal follows a valid SAK distribution from an SCI not
@@ -74,7 +78,8 @@ without pretending that an authenticated, responsive peer has disappeared.
 
 Cases cover missed-DistSAK readiness, pre-TX recovery, forward-only TX,
 queued selection and activation errors, RX drain and its deadline,
-three-second post-TX drain for both roles, key-server role changes,
+peer-confirmed old-RX retirement and its twenty-second timeout for both
+roles, key-server role changes,
 validated distribution from a new SCI,
 same-candidate retransmission, originating-CA deletion, overlapping incoming
 SAKs, occupied ANs, failed activation, signed SAK-Use omission, stale echoes,

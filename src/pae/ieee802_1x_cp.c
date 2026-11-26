@@ -339,8 +339,8 @@ SM_STATE(CP, TRANSMITTING)
 {
 	SM_ENTRY(CP, TRANSMITTING);
 	eloop_cancel_timeout(ieee802_1x_cp_transmit_when_timeout, sm, NULL);
-	/* Peer TX reports do not drain old-key frames already in flight. */
-	sm->retire_when = sm->orx ? sm->retire_delay : 0;
+	/* Retain old RX until peers confirm new TX, with a bounded escape. */
+	sm->retire_when = sm->orx ? MKA_SAK_RETIRE_FAILSAFE_TIME : 0;
 	sm->otx = false;
 	ieee802_1x_kay_set_old_sa_attr(sm->kay, sm->oki, sm->oan,
 				       sm->otx, sm->orx);
@@ -349,7 +349,7 @@ SM_STATE(CP, TRANSMITTING)
 	if (sm->retire_when &&
 	    eloop_register_timeout(sm->retire_when / 1000, 0,
 				   ieee802_1x_cp_retire_when_timeout, sm, NULL)) {
-		wpa_printf(MSG_ERROR, "CP: Could not arm old RX drain timeout");
+		wpa_printf(MSG_ERROR, "CP: Could not arm peer TX confirmation timeout");
 		SM_ENTER(CP, CHANGE);
 		ieee802_1x_kay_rekey_failed(sm->kay);
 	}
@@ -483,8 +483,15 @@ SM_STEP(CP)
 		break;
 
 	case CP_TRANSMITTING:
-		if (!sm->retire_when || changed_connect(sm))
+		if (changed_connect(sm) ||
+		    ieee802_1x_kay_all_peers_transmitting(sm->kay, sm->lki))
 			SM_ENTER(CP, RETIRE);
+		else if (!sm->retire_when) {
+			if (sm->orx)
+				wpa_printf(MSG_WARNING,
+					   "CP: Peer TX confirmation timed out; retiring old SAK");
+			SM_ENTER(CP, RETIRE);
+		}
 		break;
 
 	case CP_RETIRE:

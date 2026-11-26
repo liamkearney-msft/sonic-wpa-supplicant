@@ -331,6 +331,8 @@ int ieee802_1x_kay_enable_rx_sas(struct ieee802_1x_kay *kay,
 int ieee802_1x_kay_enable_new_info(struct ieee802_1x_kay *kay);
 bool ieee802_1x_kay_can_transmit_sak(struct ieee802_1x_kay *kay,
 				   const struct ieee802_1x_mka_ki *ki);
+bool ieee802_1x_kay_all_peers_transmitting(struct ieee802_1x_kay *kay,
+					   const struct ieee802_1x_mka_ki *ki);
 bool ieee802_1x_kay_can_abandon_sak(struct ieee802_1x_kay *kay);
 void ieee802_1x_kay_abandon_sak(struct ieee802_1x_kay *kay,
 			       const struct ieee802_1x_mka_ki *ki);

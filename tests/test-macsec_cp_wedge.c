@@ -87,6 +87,9 @@ int ieee802_1x_kay_enable_new_info(struct ieee802_1x_kay *kay)
 bool ieee802_1x_kay_can_transmit_sak(struct ieee802_1x_kay *kay,
 				   const struct ieee802_1x_mka_ki *ki)
 { (void) kay; (void) ki; return true; }
+bool ieee802_1x_kay_all_peers_transmitting(struct ieee802_1x_kay *kay,
+					   const struct ieee802_1x_mka_ki *ki)
+{ (void) kay; (void) ki; return false; }
 bool ieee802_1x_kay_can_abandon_sak(struct ieee802_1x_kay *kay)
 { (void) kay; return true; }
 void ieee802_1x_kay_abandon_sak(struct ieee802_1x_kay *kay,
@@ -254,11 +257,11 @@ static void test_reset_clears_using_transmit_sa(struct ieee802_1x_kay *kay)
 	ieee802_1x_cp_sm_deinit(sm);
 }
 
-static void test_failed_drain_timer(struct ieee802_1x_kay *kay)
+static void test_failed_retirement_timer(struct ieee802_1x_kay *kay)
 {
 	struct ieee802_1x_cp_sm *sm = drive_to_transmit(kay);
 
-	printf("test: failed old RX drain timer closes the controlled port\n");
+	printf("test: failed peer TX confirmation timer closes the controlled port\n");
 	CHECK(sm != NULL, "CP SM initialised");
 	if (!sm)
 		return;
@@ -281,7 +284,7 @@ int main(void)
 	test_pending_selection_survives_new_sak(&kay);
 	test_healthy_path_reaches_transmitting(&kay);
 	test_reset_clears_using_transmit_sa(&kay);
-	test_failed_drain_timer(&kay);
+	test_failed_retirement_timer(&kay);
 
 	printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "PASSED",
 	       failures, failures == 1 ? "" : "s");

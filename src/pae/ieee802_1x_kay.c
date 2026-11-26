@@ -2512,6 +2512,24 @@ bool ieee802_1x_kay_can_transmit_sak(struct ieee802_1x_kay *kay,
 }
 
 
+bool ieee802_1x_kay_all_peers_transmitting(struct ieee802_1x_kay *kay,
+					   const struct ieee802_1x_mka_ki *ki)
+{
+	struct data_key *key;
+	bool rx, tx, all_tx;
+
+	if (!ki)
+		return false;
+	dl_list_for_each(key, &kay->sak_list, struct data_key, list) {
+		if (is_ki_equal(&key->key_identifier, ki))
+			return ieee802_1x_kay_peer_key_use(kay, ki, key->an,
+							  &rx, &tx, &all_tx) &&
+				all_tx;
+	}
+	return false;
+}
+
+
 bool ieee802_1x_kay_can_abandon_sak(struct ieee802_1x_kay *kay)
 {
 	bool rx, tx, all_tx;
