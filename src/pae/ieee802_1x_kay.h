@@ -211,9 +211,13 @@ struct ieee802_1x_kay {
 	enum confidentiality_offset macsec_confidentiality;
 	u32 mka_hello_time;
 
-	/* State of the single installed SAK in the SecY (one SecY per port),
-	 * reported by MKA in every SAK Use body. It belongs to the KaY, not to
-	 * a per-CA participant; the principal merely reports it. */
+	/* Installed keys and the pending distribution belong to the port,
+	 * not the CA that supplied them. */
+	struct dl_list sak_list;
+	struct data_key *new_key;
+	bool to_use_sak;
+
+	/* Shared SecY key state reported by the principal in SAK Use. */
 	struct ieee802_1x_mka_ki lki;
 	u8 lan;
 	bool ltx;

@@ -368,11 +368,6 @@ ieee802_1x_kay_get_participant(struct ieee802_1x_kay *kay, const u8 *ckn,
 }
 
 
-/* Defined below; forward-declared for the principal-ownership path above. */
-static void
-ieee802_1x_kay_migrate_principal_sas(
-	struct ieee802_1x_mka_participant *old,
-	struct ieee802_1x_mka_participant *new_principal);
 static void ieee802_1x_kay_deferred_rekey(void *eloop_ctx, void *timeout_ctx);
 static void ieee802_1x_kay_arm_deferred_rekey(struct ieee802_1x_kay *kay);
 
@@ -381,8 +376,8 @@ static void ieee802_1x_kay_arm_deferred_rekey(struct ieee802_1x_kay *kay);
  * ieee802_1x_kay_set_principal_participant - Set the CP-owning participant
  *
  * The principal owns the single CP state machine and SecY programming.
- * Installed-SAK bookkeeping moves with the pointer, so a later CP RETIRE can
- * still free the key and distribution carries over until the next rekey.
+ * Key bookkeeping remains on the port; the incoming principal inherits the
+ * negotiated MACsec advisory until the next negotiation.
  */
 static void
 ieee802_1x_kay_set_principal_participant(
@@ -392,11 +387,14 @@ ieee802_1x_kay_set_principal_participant(
 	if (kay->principal_participant == participant)
 		return;
 
-	if (participant && kay->principal_participant)
+	if (participant && kay->principal_participant) {
 		ieee802_1x_cp_abandon_latest_sak(kay->cp);
 
-	ieee802_1x_kay_migrate_principal_sas(kay->principal_participant,
-					     participant);
+		participant->advised_desired =
+			kay->principal_participant->advised_desired;
+		participant->advised_capability =
+			kay->principal_participant->advised_capability;
+	}
 
 	/* Drop any deferred rekey left on the outgoing principal: if this CA is
 	 * re-promoted, the stale request would rekey a CA that has not settled.
@@ -1451,7 +1449,7 @@ static bool
 ieee802_1x_mka_sak_use_body_present(
 	struct ieee802_1x_mka_participant *participant)
 {
-	return ieee802_1x_kay_principal_or_self(participant)->to_use_sak;
+	return participant->kay->to_use_sak;
 }
 
 
@@ -1725,7 +1723,7 @@ ieee802_1x_mka_decode_sak_use_body(
 	 * where this can happen such as when a new participant joins the CA and
 	 * the first frame it receives can have a SAKuse but not distSAK.
 	 */
-	sa_key = dl_list_first(&participant->sak_list, struct data_key, list);
+	sa_key = dl_list_first(&kay->sak_list, struct data_key, list);
 	if (!sa_key) {
 		wpa_printf(MSG_INFO,
 			   "KaY: We don't have a latest distributed key - ignore SAK use");
@@ -1901,8 +1899,9 @@ static bool
 ieee802_1x_mka_dist_sak_body_present(
 	struct ieee802_1x_mka_participant *participant)
 {
-	return participant->is_key_server && participant->to_dist_sak &&
-		participant->new_key;
+	return participant == ieee802_1x_kay_principal_or_self(participant) &&
+		participant->is_key_server && participant->to_dist_sak &&
+		participant->kay->new_key;
 }
 
 
@@ -1952,7 +1951,7 @@ ieee802_1x_mka_encode_dist_sak_body(
 		return 0;
 	}
 
-	sak = participant->new_key;
+	sak = participant->kay->new_key;
 	if (!sak) {
 		wpa_printf(MSG_DEBUG,
 			   "KaY: No SAK available to build Distributed SAK parameter set");
@@ -2079,11 +2078,11 @@ ieee802_1x_mka_decode_dist_sak_body(
 			ieee802_1x_kay_get_principal_participant(kay);
 
 		participant->advised_desired = false;
-		participant->to_use_sak = false;
 		/* Only the CP owner (or nobody, at cold start) may downgrade
 		 * the shared data path, so a standby CA's "no MACsec" advisory
 		 * can't tear down another CA's live session. */
 		if (!principal || principal == participant) {
+			kay->to_use_sak = false;
 			kay->authenticated = true;
 			kay->secured = false;
 			kay->failed = false;
@@ -2096,7 +2095,7 @@ ieee802_1x_mka_decode_dist_sak_body(
 
 	body = (struct ieee802_1x_mka_dist_sak_body *)mka_msg;
 	ieee802_1x_mka_dump_dist_sak_body(body);
-	dl_list_for_each(sa_key, &participant->sak_list, struct data_key, list)
+	dl_list_for_each(sa_key, &kay->sak_list, struct data_key, list)
 	{
 		if (os_memcmp(sa_key->key_identifier.mi,
 			      participant->current_peer_id.mi, MI_LEN) == 0 &&
@@ -2193,7 +2192,7 @@ ieee802_1x_mka_decode_dist_sak_body(
 	ieee802_1x_kay_init_data_key(sa_key);
 
 	ieee802_1x_kay_use_data_key(sa_key);
-	dl_list_add(&participant->sak_list, &sa_key->list);
+	dl_list_add(&kay->sak_list, &sa_key->list);
 
 	ieee802_1x_cp_set_ciphersuite(kay->cp, cs->id);
 	ieee802_1x_cp_sm_step(kay->cp);
@@ -2205,7 +2204,7 @@ ieee802_1x_mka_decode_dist_sak_body(
 	ieee802_1x_cp_sm_step(kay->cp);
 
 	kay->rcvd_keys++;
-	participant->to_use_sak = true;
+	kay->to_use_sak = true;
 
 	return 0;
 }
@@ -2685,10 +2684,10 @@ ieee802_1x_kay_generate_new_sak(struct ieee802_1x_mka_participant *participant)
 	}
 	ieee802_1x_kay_init_data_key(sa_key);
 
-	participant->new_key = sa_key;
+	kay->new_key = sa_key;
 
 	ieee802_1x_kay_use_data_key(sa_key);
-	dl_list_add(&participant->sak_list, &sa_key->list);
+	dl_list_add(&kay->sak_list, &sa_key->list);
 
 	ieee802_1x_cp_set_ciphersuite(kay->cp, cs->id);
 	ieee802_1x_cp_sm_step(kay->cp);
@@ -2871,7 +2870,7 @@ ieee802_1x_kay_elect_key_server(struct ieee802_1x_mka_participant *participant,
 
 		/* Defer a handover with a retained SAK, preserving any pending
 		 * settle window. Ordinary peer elections need no new window. */
-		if (participant->to_use_sak &&
+		if (kay->to_use_sak &&
 		    (principal_change ||
 		     eloop_is_timeout_registered(ieee802_1x_kay_deferred_rekey,
 						 kay, NULL)))
@@ -2963,7 +2962,7 @@ ieee802_1x_kay_decide_macsec_use(
 	} else {
 		participant->advised_desired = false;
 		participant->advised_capability = MACSEC_CAP_NOT_IMPLEMENTED;
-		participant->to_use_sak = false;
+		kay->to_use_sak = false;
 		kay->authenticated = true;
 		kay->secured = false;
 		kay->failed = false;
@@ -3084,46 +3083,6 @@ static void ieee802_1x_delete_transmit_sa(struct ieee802_1x_kay *kay,
 
 
 /**
- * ieee802_1x_kay_migrate_principal_sas - Re-home installed-SAK bookkeeping
- *
- * SCs/SAs are shared on the KaY, but sak_list is per-CA. The installed
- * data_key must follow the principal pointer so a later CP RETIRE (which
- * searches the principal's sak_list) can free it. Pure bookkeeping - no secy_*
- * calls, which is what makes the switch-over hitless.
- */
-static void
-ieee802_1x_kay_migrate_principal_sas(
-	struct ieee802_1x_mka_participant *old,
-	struct ieee802_1x_mka_participant *new_principal)
-{
-	struct data_key *sak, *pre_sak;
-
-	if (!old || !new_principal || old == new_principal)
-		return;
-
-	wpa_printf(MSG_DEBUG,
-		   "KaY: Re-homing installed SAK bookkeeping to new principal");
-
-	/* Move the installed SAK(s); the shared SAs already reference them. */
-	dl_list_for_each_safe(sak, pre_sak, &old->sak_list, struct data_key,
-			      list) {
-		dl_list_del(&sak->list);
-		dl_list_add_tail(&new_principal->sak_list, &sak->list);
-	}
-
-	/* Carry over distribution state so the new principal keeps driving the
-	 * installed SAK until the next rekey. */
-	new_principal->to_use_sak = old->to_use_sak;
-	new_principal->new_key = old->new_key;
-	new_principal->advised_desired = old->advised_desired;
-	new_principal->advised_capability = old->advised_capability;
-
-	old->new_key = NULL;
-	old->to_use_sak = false;
-}
-
-
-/**
  * ieee802_1x_kay_select_principal - Choose which CA should own the CP
  *
  * First match wins:
@@ -3183,7 +3142,7 @@ ieee802_1x_kay_select_principal(struct ieee802_1x_kay *kay)
 /**
  * ieee802_1x_kay_deferred_rekey - Fire the post-promotion key-material rekey
  *
- * A promotion keeps running the migrated SAK, so deferring the fresh SAK by a
+ * A promotion keeps running the retained SAK, so deferring the fresh SAK by a
  * few hello times lets both ends settle before it runs as an ordinary
  * make-before-break rekey under the new principal's CKN.
  */
@@ -3203,7 +3162,7 @@ static void ieee802_1x_kay_deferred_rekey(void *eloop_ctx, void *timeout_ctx)
 		return;
 
 	/* Ownership moved again before this fired, so restart the window; the
-	 * migrated SAK keeps the data path up meanwhile. */
+	 * retained SAK keeps the data path up meanwhile. */
 	if (kay->principal_changed) {
 		ieee802_1x_kay_arm_deferred_rekey(kay);
 		return;
@@ -3413,20 +3372,18 @@ static void ieee802_1x_participant_timer(void *eloop_ctx, void *timeout_ctx)
 		if (!dl_list_empty(&participant->live_peers))
 			ieee802_1x_kay_elect_key_server(participant, false);
 
-		/* Reconcile before quiescing a now-peerless CA: the migration
-		 * below carries to_use_sak onto the new principal, so clearing
-		 * it first would drop the SAK-Use body for the still-installed
-		 * SAK and open a datapath gap until the next rekey. */
+		/* Preserve the negotiated advisory for an incoming principal
+		 * before quiescing a now-peerless CA. */
 		ieee802_1x_kay_reconcile_principal(kay);
 
 		if (dl_list_empty(&participant->live_peers)) {
-			/* Now inert: stop advertising so a peerless CA does not
-			 * offer a retired SAK. Any continuity was already
-			 * migrated to the new principal. */
+			/* A peerless standby must not clear the port's SAK Use. */
 			participant->advised_desired = false;
 			participant->advised_capability =
 				MACSEC_CAP_NOT_IMPLEMENTED;
-			participant->to_use_sak = false;
+			if (!kay->principal_participant ||
+			    kay->principal_participant == participant)
+				kay->to_use_sak = false;
 			participant->is_key_server = false;
 			participant->is_elected = false;
 		}
@@ -3707,12 +3664,12 @@ int ieee802_1x_kay_create_sas(struct ieee802_1x_kay *kay,
 		return -1;
 
 	latest_sak = NULL;
-	dl_list_for_each(sa_key, &principal->sak_list, struct data_key, list) {
+	dl_list_for_each(sa_key, &kay->sak_list, struct data_key, list) {
 		if (is_ki_equal(&sa_key->key_identifier, lki)) {
 			sa_key->rx_latest = true;
 			sa_key->tx_latest = true;
 			latest_sak = sa_key;
-			principal->to_use_sak = true;
+			kay->to_use_sak = true;
 		} else {
 			sa_key->rx_latest = false;
 			sa_key->tx_latest = false;
@@ -3805,11 +3762,11 @@ int ieee802_1x_kay_delete_sas(struct ieee802_1x_kay *kay,
 	}
 
 	/* remove the sak */
-	dl_list_for_each_safe(sa_key, pre_key, &principal->sak_list,
+	dl_list_for_each_safe(sa_key, pre_key, &kay->sak_list,
 			      struct data_key, list) {
 		if (is_ki_equal(&sa_key->key_identifier, ki)) {
-			if (principal->new_key == sa_key)
-				principal->new_key = NULL;
+			if (kay->new_key == sa_key)
+				kay->new_key = NULL;
 			dl_list_del(&sa_key->list);
 			ieee802_1x_kay_deinit_data_key(sa_key);
 			break;
@@ -4361,6 +4318,7 @@ ieee802_1x_kay_init(struct ieee802_1x_kay_ctx *ctx, enum macsec_policy policy,
 		  sizeof(kay->algo_agility));
 
 	dl_list_init(&kay->participant_list);
+	dl_list_init(&kay->sak_list);
 	dl_list_init(&kay->rxsc_list);
 	kay->txsc = NULL;
 	if (policy != DO_NOT_SECURE &&
@@ -4607,10 +4565,7 @@ ieee802_1x_kay_create_mka(struct ieee802_1x_kay *kay,
 		   mi_txt(participant->mi));
 
 	participant->to_dist_sak = false;
-	participant->to_use_sak = false;
 	participant->new_sak = false;
-	dl_list_init(&participant->sak_list);
-	participant->new_key = NULL;
 	/* to derive KEK from CAK and CKN */
 	participant->kek.len = participant->cak.len;
 	if (mka_alg_tbl[kay->mka_algindex].kek_trfm(participant->cak.key,
@@ -4706,13 +4661,11 @@ ieee802_1x_kay_delete_mka(struct ieee802_1x_kay *kay, struct mka_key_name *ckn)
 	eloop_cancel_timeout(ieee802_1x_participant_timer, participant, NULL);
 	dl_list_del(&participant->list);
 
-	/* Recompute CP ownership before teardown, while this participant's SAK
-	 * list is still intact to be migrated. Unlinking alone is not enough:
+	/* Recompute CP ownership before teardown. Unlinking alone is not enough:
 	 * select_principal()'s incumbent-retention rules re-select the current
 	 * principal by pointer, so they would re-pick this participant and
 	 * leave a dangling pointer once we free it. Clearing ->active blocks
-	 * them while keeping it the principal, so its SAK can still be
-	 * re-homed. */
+	 * them while preserving the advisory transfer to the next principal. */
 	participant->active = false;
 	ieee802_1x_kay_reconcile_principal(kay);
 
@@ -4733,19 +4686,20 @@ ieee802_1x_kay_delete_mka(struct ieee802_1x_kay *kay, struct mka_key_name *ckn)
 		os_free(peer);
 	}
 
-	/* remove sak */
-	while (!dl_list_empty(&participant->sak_list)) {
-		sak = dl_list_entry(participant->sak_list.next,
-				    struct data_key, list);
-		dl_list_del(&sak->list);
-		ieee802_1x_kay_deinit_data_key(sak);
-	}
-
-	/* Shared per-port SecY state: tear the transmit SC down only when the
-	 * last participant is removed. */
-	if (dl_list_empty(&kay->participant_list) && kay->txsc) {
-		ieee802_1x_kay_deinit_transmit_sc(kay, kay->txsc);
-		kay->txsc = NULL;
+	/* Shared keys and transmit SC outlive any individual CA. */
+	if (dl_list_empty(&kay->participant_list)) {
+		if (kay->txsc) {
+			ieee802_1x_kay_deinit_transmit_sc(kay, kay->txsc);
+			kay->txsc = NULL;
+		}
+		kay->new_key = NULL;
+		kay->to_use_sak = false;
+		while (!dl_list_empty(&kay->sak_list)) {
+			sak = dl_list_entry(kay->sak_list.next,
+					    struct data_key, list);
+			dl_list_del(&sak->list);
+			ieee802_1x_kay_deinit_data_key(sak);
+		}
 	}
 
 	os_memset(&participant->cak, 0, sizeof(participant->cak));
