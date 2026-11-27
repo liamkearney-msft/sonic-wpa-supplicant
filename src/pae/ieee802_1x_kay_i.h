@@ -121,8 +121,6 @@ struct ieee802_1x_mka_participant {
 	bool can_be_key_server;
 	bool is_elected;
 
-	struct dl_list sak_list;
-
 	u8 mi[MI_LEN];
 	u32 mn;
 
@@ -133,13 +131,11 @@ struct ieee802_1x_mka_participant {
 	time_t cak_life;
 	time_t mka_life;
 	bool to_dist_sak;
-	bool to_use_sak;
 	bool new_sak;
 
 	bool advised_desired;
 	enum macsec_cap advised_capability;
 
-	struct data_key *new_key;
 	u32 retry_count;
 
 	struct ieee802_1x_kay *kay;

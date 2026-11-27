@@ -448,7 +448,8 @@ SM_STEP(CP)
 	case CP_READY:
 		if (sm->new_sak || changed_connect(sm))
 			SM_ENTER(CP, ABANDON);
-		else if (sm->server_transmitting || !sm->controlled_port_enabled)
+		else if ((sm->elected_self && sm->all_receiving) ||
+			 sm->server_transmitting || !sm->controlled_port_enabled)
 			SM_ENTER(CP, TRANSMIT);
 		break;
 	case CP_ABANDON:
