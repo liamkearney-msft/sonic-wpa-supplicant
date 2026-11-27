@@ -3,7 +3,7 @@ ALL=test-base64 test-md4 test-milenage \
 	test-sha1 \
 	test-https test-https_server \
 	test-sha256 test-aes test-x509v3 test-list test-rc4 \
-	test-macsec_cp_wedge test-macsec_status
+	test-macsec_cp_wedge test-macsec_status test-macsec_rollover
 
 include ../src/build.rules
 
@@ -57,6 +57,20 @@ test-macsec_status: test-macsec_status.c ../src/pae/ieee802_1x_kay.c \
 	$(CC) $(CFLAGS) -DCONFIG_CTRL_IFACE -ffunction-sections -fdata-sections \
 		$(LDFLAGS) -Wl,--gc-sections -o $@ $(filter %.c,$^)
 
+test-macsec_rollover-sanitize: CFLAGS += -O1 -fsanitize=address,undefined -fno-omit-frame-pointer
+test-macsec_rollover test-macsec_rollover-sanitize: test-macsec_rollover.c ../src/pae/ieee802_1x_kay.c \
+		../src/pae/ieee802_1x_cp.c ../src/pae/ieee802_1x_kay.h \
+		../src/pae/ieee802_1x_kay_i.h ../src/pae/ieee802_1x_cp.h \
+		../src/pae/ieee802_1x_secy_ops.c ../src/pae/ieee802_1x_key.c \
+		../src/utils/common.c ../src/utils/os_unix.c \
+		../src/utils/wpa_debug.c ../src/utils/wpabuf.c \
+		../src/utils/eloop.c ../src/crypto/crypto_openssl.c
+	$(CC) $(CFLAGS) -DCONFIG_MACSEC -DCONFIG_OPENSSL_CMAC \
+		-Wno-unused-parameter -Wno-unused-function \
+		-Wno-deprecated-declarations -ffunction-sections -fdata-sections \
+		$(LDFLAGS) -Wl,--gc-sections -o $@ $< \
+		$(filter-out ../src/pae/ieee802_1x_kay.c ../src/pae/ieee802_1x_cp.c,$(filter ../%.c,$^)) -lcrypto
+
 test-aes: $(call BUILDOBJ,test-aes.o) $(LIBS)
 	$(LDO) $(LDFLAGS) -o $@ $^ $(LLIBS)
 
@@ -103,10 +117,12 @@ run-tests: $(ALL)
 	./test-sha1
 	./test-sha256
 	./test-macsec_cp_wedge
+	./test-macsec_rollover
 	@echo
 	@echo All tests completed successfully.
 
 clean: common-clean
+	rm -f test-macsec_rollover-sanitize
 	rm -f *~
 	rm -f test_x509v3_nist.out.*
 	rm -f test_x509v3_nist2.out.*

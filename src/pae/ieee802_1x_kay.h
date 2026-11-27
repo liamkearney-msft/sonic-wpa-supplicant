@@ -266,6 +266,9 @@ struct ieee802_1x_kay {
 	 * CAs that see that peer (see struct receive_sc::refcnt). */
 	struct transmit_sc *txsc;
 	struct dl_list rxsc_list;
+	/* CP's installed SAKs outlive any CA that authenticated them. */
+	struct dl_list sak_list;
+	struct data_key *new_key;
 
 	struct ieee802_1x_cp_sm *cp;
 
@@ -303,6 +306,9 @@ void ieee802_1x_kay_mka_participate(struct ieee802_1x_kay *kay,
 				    struct mka_key_name *ckn,
 				    bool status);
 int ieee802_1x_kay_new_sak(struct ieee802_1x_kay *kay);
+bool ieee802_1x_kay_tx_sak_in_use(struct ieee802_1x_kay *kay,
+				const struct ieee802_1x_mka_ki *ki);
+void ieee802_1x_kay_update_sak_use(struct ieee802_1x_kay *kay);
 int ieee802_1x_kay_change_cipher_suite(struct ieee802_1x_kay *kay,
 				       unsigned int cs_index);
 

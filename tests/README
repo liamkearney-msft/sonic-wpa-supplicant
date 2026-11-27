@@ -24,6 +24,43 @@ cd build
 ./run-build-tests.h
 
 
+MACsec rollover
+---------------
+
+Build and run the offline paired regression (requires OpenSSL headers/libcrypto):
+
+make -C tests test-macsec_rollover test-macsec_rollover-sanitize
+./tests/test-macsec_rollover
+ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 ./tests/test-macsec_rollover-sanitize
+
+The test includes production KaY and CP and links the real SecY, MKA key
+derivation, authentication and event-loop sources. Only hardware and packet
+transport are replaced. An established primary/fallback pair loses PRIMARY
+on the follower only; the server promotes fallback through its participant
+timer's actual primary-peer expiry path. Four rollover phases cover missed
+DistSAK, installed follower RX with a lost reply, server-only candidate TX,
+and both endpoints transmitting the candidate. Each runs with the ordinary
+transmit deadline before and after primary expiry. Periodic rekey is disabled;
+the first promotion-triggered fallback rekey must complete exactly once.
+
+Every exchange checks selected TX against enabled peer RX, exact key bytes,
+port availability, and retained packet numbers. Hardware callbacks reject
+withdrawal of selected TX or required RX. Additional cases cover authenticated
+wrong KI/AN, old-slot confirmations, stale message numbers/acknowledgments,
+bad ICV, retracted/expired advice, multiple live peers, overlapping requests,
+the existing logged 20-second RX-retirement escape, actually absent-TX
+recovery, queued proposals, last-CA teardown, and real cipher/authorization
+changes. MKA_DEBUG=1 enables production diagnostic logs. These are software
+checks, not hardware qualification.
+
+Installed SAK inventory belongs to the port, not a CA. A principal change
+does not recreate committed SAs. New proposals wait for the installed rollover;
+an uncommitted proposal may be withdrawn only by its server or with every
+live peer's exact old-TX confirmation. Both roles retain old RX until exact
+peer TX confirmation or the existing 20-second failsafe. The transmit
+deadline alone is not evidence that a peer received a SAK.
+
+
 Fuzz testing
 ------------
 

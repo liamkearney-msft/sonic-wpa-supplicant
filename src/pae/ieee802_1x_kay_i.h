@@ -54,6 +54,9 @@ struct ieee802_1x_kay_peer {
 	enum macsec_cap macsec_capability;
 	bool sak_used;
 	bool sak_txed;
+	bool sak_use_seen;
+	/* Withdrawal evidence for the port's current old KI+AN only. */
+	bool old_sak_txed;
 	int missing_sak_use_count;
 	/* ANs the peer last reported an SA on. */
 	u8 sa_an_mask;
@@ -122,8 +125,6 @@ struct ieee802_1x_mka_participant {
 	bool can_be_key_server;
 	bool is_elected;
 
-	struct dl_list sak_list;
-
 	u8 mi[MI_LEN];
 	u32 mn;
 
@@ -140,7 +141,6 @@ struct ieee802_1x_mka_participant {
 	bool advised_desired;
 	enum macsec_cap advised_capability;
 
-	struct data_key *new_key;
 	u32 retry_count;
 
 	struct ieee802_1x_kay *kay;

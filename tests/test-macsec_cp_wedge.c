@@ -82,6 +82,11 @@ int ieee802_1x_kay_enable_rx_sas(struct ieee802_1x_kay *kay,
 { (void) kay; (void) lki; return 0; }
 int ieee802_1x_kay_enable_new_info(struct ieee802_1x_kay *kay)
 { (void) kay; return 0; }
+bool ieee802_1x_kay_tx_sak_in_use(struct ieee802_1x_kay *kay,
+				const struct ieee802_1x_mka_ki *ki)
+{ (void) kay; (void) ki; return false; }
+void ieee802_1x_kay_update_sak_use(struct ieee802_1x_kay *kay)
+{ (void) kay; }
 
 /* eloop: no-ops. The test drives the SM synchronously; no timers needed. */
 int eloop_cancel_timeout(eloop_timeout_handler handler, void *eloop_data,
@@ -192,7 +197,8 @@ static void test_wedge_escapes_on_new_sak(struct ieee802_1x_kay *kay)
  * Healthy path: when the transmit SA asserts, CP_TRANSMIT must still advance
  * to CP_TRANSMITTING (the escape branch must not steal the transition).
  */
-static void test_healthy_path_reaches_transmitting(struct ieee802_1x_kay *kay)
+static void test_healthy_path_reaches_transmitting(struct ieee802_1x_kay *kay,
+						 bool new_sak)
 {
 	struct ieee802_1x_cp_sm *sm = drive_to_transmit(kay);
 
@@ -204,6 +210,7 @@ static void test_healthy_path_reaches_transmitting(struct ieee802_1x_kay *kay)
 
 	/* KaY confirms the transmit SA is installed and in use. */
 	sm->using_transmit_sa = true;
+	sm->new_sak = new_sak;
 	sm_CP_Step(sm);
 
 	printf("  after usingTransmitSA, state %s\n",
@@ -229,16 +236,15 @@ static void test_abandon_clears_using_transmit_sa(struct ieee802_1x_kay *kay)
 		return;
 	CHECK(sm->CP_state == CP_TRANSMIT, "precondition: CP is in CP_TRANSMIT");
 
-	/* Transmit SA asserted, then a new SAK lands in the same window: the CP
-	 * diverts CP_TRANSMIT -> ABANDON rather than -> TRANSMITTING. */
+	/* A genuine connectivity change still abandons the current SA. */
 	sm->using_transmit_sa = true;
-	sm->new_sak = true;
+	sm->connect = PENDING;
 	sm_CP_Step(sm);
 
-	printf("  after new SAK, state %s, usingTransmitSA=%d\n",
+	printf("  after connectivity change, state %s, usingTransmitSA=%d\n",
 	       cp_state_name(sm->CP_state), sm->using_transmit_sa);
 	CHECK(sm->CP_state == CP_ABANDON,
-	      "CP diverted CP_TRANSMIT -> ABANDON on new SAK");
+	      "CP diverted CP_TRANSMIT -> ABANDON on connectivity change");
 	CHECK(!sm->using_transmit_sa,
 	      "ABANDON cleared usingTransmitSA (no stale true into next cycle)");
 
@@ -252,7 +258,8 @@ int main(void)
 	memset(&kay, 0, sizeof(kay));
 
 	test_wedge_escapes_on_new_sak(&kay);
-	test_healthy_path_reaches_transmitting(&kay);
+	test_healthy_path_reaches_transmitting(&kay, false);
+	test_healthy_path_reaches_transmitting(&kay, true);
 	test_abandon_clears_using_transmit_sa(&kay);
 
 	printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "PASSED",

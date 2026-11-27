@@ -296,14 +296,8 @@ SM_STATE(CP, TRANSMIT)
 SM_STATE(CP, TRANSMITTING)
 {
 	SM_ENTRY(CP, TRANSMITTING);
-	/* The key server holds the old SA until every live peer has moved its
-	 * transmit to the new SAK (the all_transmitting gate in SM_STEP), so
-	 * retire_when is only a long failsafe for a live peer that never
-	 * confirms. A non key server cannot observe all_transmitting and keeps
-	 * the stock short timer. */
-	sm->retire_when = sm->orx ?
-		(sm->elected_self ? MKA_SAK_RETIRE_FAILSAFE_TIME :
-		 sm->retire_delay) : 0;
+	/* Both roles retain old RX until exact peer TX confirmation. */
+	sm->retire_when = sm->orx ? MKA_SAK_RETIRE_FAILSAFE_TIME : 0;
 	sm->otx = false;
 	ieee802_1x_kay_set_old_sa_attr(sm->kay, sm->oki, sm->oan,
 				       sm->otx, sm->orx);
@@ -411,29 +405,24 @@ SM_STEP(CP)
 		else if (!sm->elected_self)
 			SM_ENTER(CP, READY);
 		else if (sm->elected_self &&
-		    (sm->all_receiving || !sm->controlled_port_enabled ||
-		     !sm->transmit_when))
+		    (sm->all_receiving || !sm->controlled_port_enabled))
 			SM_ENTER(CP, TRANSMIT);
 		break;
 
 	case CP_TRANSMIT:
-		/* Escape on new SAK or connectivity change so the CP cannot
-		 * wedge here when usingTransmitSA never asserts. Mirrors
-		 * CP_RECEIVING / CP_READY. */
-		if (sm->new_sak || changed_connect(sm))
+		/* Preserve teardown recovery without rolling back selected TX. */
+		if (changed_connect(sm))
 			SM_ENTER(CP, ABANDON);
 		else if (sm->using_transmit_sa)
 			SM_ENTER(CP, TRANSMITTING);
+		else if (sm->new_sak &&
+			 !ieee802_1x_kay_tx_sak_in_use(sm->kay, sm->lki))
+			SM_ENTER(CP, ABANDON);
 		break;
 
 	case CP_TRANSMITTING:
-		/* Retire the old SA once every live peer has advanced its
-		 * transmit to the latest SAK, so a slow peer's old RX SA is not
-		 * torn down while still in use. new_sak must also break out:
-		 * this is the only state with no path back to RECEIVE, and the
-		 * key server distributes regardless of CP state, so waiting on
-		 * the failsafe would leave the next SAK with no receive SA. */
-		if (sm->all_transmitting || !sm->retire_when || sm->new_sak ||
+		/* A queued rekey must not retire an RX SA still used by a peer. */
+		if (sm->all_transmitting || !sm->retire_when ||
 		    changed_connect(sm))
 			SM_ENTER(CP, RETIRE);
 		break;
@@ -527,6 +516,7 @@ static void ieee802_1x_cp_step_run(struct ieee802_1x_cp_sm *sm)
 	enum cp_states prev_state;
 	int i;
 
+	ieee802_1x_kay_update_sak_use(sm->kay);
 	for (i = 0; i < 100; i++) {
 		prev_state = sm->CP_state;
 		SM_STEP_RUN(CP);
@@ -722,8 +712,12 @@ void ieee802_1x_cp_abandon_latest_sak(void *cp_ctx)
 {
 	struct ieee802_1x_cp_sm *sm = cp_ctx;
 
+	if (sm->new_sak && !sm->lki && sm->oki && sm->otx) {
+		ieee802_1x_kay_delete_sas(sm->kay, &sm->distributed_ki);
+		sm->new_sak = false;
+	}
 	if ((sm->CP_state == CP_RECEIVE ||
-	     sm->CP_state == CP_RECEIVING) &&
+	     sm->CP_state == CP_RECEIVING || sm->CP_state == CP_READY) &&
 	    sm->lki && !sm->ltx && sm->oki && sm->otx) {
 		/* Keep the old SAK active if a peer missed DistSAK on CA change. */
 		eloop_cancel_timeout(ieee802_1x_cp_transmit_when_timeout,
@@ -731,6 +725,23 @@ void ieee802_1x_cp_abandon_latest_sak(void *cp_ctx)
 		SM_ENTER(CP, ABANDON);
 		ieee802_1x_cp_sm_step(sm);
 	}
+}
+
+
+bool ieee802_1x_cp_sak_pending(void *cp_ctx)
+{
+	struct ieee802_1x_cp_sm *sm = cp_ctx;
+
+	if (sm->new_sak)
+		return true;
+	/* Preserve the teardown recovery from CP_TRANSMIT: no installed TX
+	 * path means a new SAK must still be able to break the wedge. */
+	if (changed_connect(sm) ||
+	    (sm->CP_state == CP_TRANSMIT && !sm->using_transmit_sa &&
+	     !ieee802_1x_kay_tx_sak_in_use(sm->kay, sm->lki)))
+		return false;
+
+	return sm->lki != NULL;
 }
 
 
@@ -780,6 +791,11 @@ static void ieee802_1x_cp_retire_when_timeout(void *eloop_ctx,
 					      void *timeout_ctx)
 {
 	struct ieee802_1x_cp_sm *sm = eloop_ctx;
+
+	if (sm->CP_state == CP_TRANSMITTING && sm->orx &&
+	    !sm->all_transmitting)
+		wpa_printf(MSG_WARNING,
+			   "CP: Peer TX confirmation timed out; retiring old SAK");
 	sm->retire_when = 0;
 	ieee802_1x_cp_step_run(sm);
 }

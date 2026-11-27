@@ -1,6 +1,6 @@
 name: MACsec CP unit test
 
-# These MACsec unit tests need only a C compiler.
+# The paired regression uses OpenSSL for production MKA authentication.
 
 on:
   pull_request:
@@ -22,3 +22,12 @@ jobs:
         run: |
           make -C tests test-macsec_status
           ./tests/test-macsec_status
+
+      - name: Install paired regression dependency
+        run: sudo apt-get update -qq && sudo apt-get install -y libssl-dev
+
+      - name: Check authenticated MACsec rollover
+        run: |
+          make -C tests test-macsec_rollover test-macsec_rollover-sanitize
+          ./tests/test-macsec_rollover
+          ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 ./tests/test-macsec_rollover-sanitize
