@@ -296,21 +296,19 @@ SM_STATE(CP, TRANSMIT)
 SM_STATE(CP, TRANSMITTING)
 {
 	SM_ENTRY(CP, TRANSMITTING);
-	/* The key server holds the old SA until every live peer has moved its
-	 * transmit to the new SAK (the all_transmitting gate in SM_STEP), so
-	 * retire_when is only a long failsafe for a live peer that never
-	 * confirms. A non key server cannot observe all_transmitting and keeps
-	 * the stock short timer. */
-	sm->retire_when = sm->orx ?
-		(sm->elected_self ? MKA_SAK_RETIRE_FAILSAFE_TIME :
-		 sm->retire_delay) : 0;
+	/* Both roles retain old RX until exact peer TX confirmation. */
+	sm->retire_when = sm->orx ? MKA_SAK_RETIRE_FAILSAFE_TIME : 0;
 	sm->otx = false;
 	ieee802_1x_kay_set_old_sa_attr(sm->kay, sm->oki, sm->oan,
 				       sm->otx, sm->orx);
 	ieee802_1x_kay_enable_new_info(sm->kay);
 	eloop_cancel_timeout(ieee802_1x_cp_retire_when_timeout, sm, NULL);
-	eloop_register_timeout(sm->retire_when / 1000, 0,
-			       ieee802_1x_cp_retire_when_timeout, sm, NULL);
+	if (sm->retire_when &&
+	    eloop_register_timeout(sm->retire_when / 1000, 0,
+				   ieee802_1x_cp_retire_when_timeout, sm, NULL)) {
+		wpa_printf(MSG_ERROR, "CP: Could not arm peer TX confirmation timeout");
+		SM_ENTER(CP, CHANGE);
+	}
 	sm->using_transmit_sa = false;
 }
 
@@ -410,9 +408,7 @@ SM_STEP(CP)
 			SM_ENTER(CP, ABANDON);
 		else if (!sm->elected_self)
 			SM_ENTER(CP, READY);
-		else if (sm->elected_self &&
-		    (sm->all_receiving || !sm->controlled_port_enabled ||
-		     !sm->transmit_when))
+		else if (ieee802_1x_kay_can_transmit_sak(sm->kay, sm->lki))
 			SM_ENTER(CP, TRANSMIT);
 		break;
 
@@ -427,15 +423,15 @@ SM_STEP(CP)
 		break;
 
 	case CP_TRANSMITTING:
-		/* Retire the old SA once every live peer has advanced its
-		 * transmit to the latest SAK, so a slow peer's old RX SA is not
-		 * torn down while still in use. new_sak must also break out:
-		 * this is the only state with no path back to RECEIVE, and the
-		 * key server distributes regardless of CP state, so waiting on
-		 * the failsafe would leave the next SAK with no receive SA. */
-		if (sm->all_transmitting || !sm->retire_when || sm->new_sak ||
-		    changed_connect(sm))
+		if (changed_connect(sm) ||
+		    ieee802_1x_kay_all_peers_transmitting(sm->kay, sm->lki))
 			SM_ENTER(CP, RETIRE);
+		else if (!sm->retire_when) {
+			if (sm->orx)
+				wpa_printf(MSG_WARNING,
+					   "CP: Peer TX confirmation timed out; retiring old SAK");
+			SM_ENTER(CP, RETIRE);
+		}
 		break;
 
 	case CP_RETIRE:
@@ -448,8 +444,8 @@ SM_STEP(CP)
 	case CP_READY:
 		if (sm->new_sak || changed_connect(sm))
 			SM_ENTER(CP, ABANDON);
-		else if ((sm->elected_self && sm->all_receiving) ||
-			 sm->server_transmitting || !sm->controlled_port_enabled)
+		else if ((sm->elected_self || sm->server_transmitting) &&
+			 ieee802_1x_kay_can_transmit_sak(sm->kay, sm->lki))
 			SM_ENTER(CP, TRANSMIT);
 		break;
 	case CP_ABANDON:

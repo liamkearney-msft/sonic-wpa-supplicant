@@ -131,6 +131,13 @@ struct receive_sc {
 	 * the last CA drops its peer. */
 	int refcnt;
 
+	/* Authenticated key-use evidence shared by CAs for this physical peer. */
+	struct ieee802_1x_mka_ki sak_ki[2];
+	u8 sak_an[2];
+	bool sak_rx[2];
+	bool sak_tx[2];
+	time_t sak_use_expire;
+
 	struct dl_list list;
 	struct dl_list sa_list;
 };
@@ -324,6 +331,10 @@ int ieee802_1x_kay_enable_tx_sas(struct ieee802_1x_kay *kay,
 int ieee802_1x_kay_enable_rx_sas(struct ieee802_1x_kay *kay,
 				 struct ieee802_1x_mka_ki *lki);
 int ieee802_1x_kay_enable_new_info(struct ieee802_1x_kay *kay);
+bool ieee802_1x_kay_can_transmit_sak(struct ieee802_1x_kay *kay,
+				   const struct ieee802_1x_mka_ki *ki);
+bool ieee802_1x_kay_all_peers_transmitting(struct ieee802_1x_kay *kay,
+					   const struct ieee802_1x_mka_ki *ki);
 int ieee802_1x_kay_get_status(struct ieee802_1x_kay *kay, char *buf,
 			      size_t buflen);
 int ieee802_1x_kay_get_macsec(struct ieee802_1x_kay *kay, char *buf,
