@@ -372,10 +372,11 @@ static void ieee802_1x_kay_deferred_rekey(void *eloop_ctx, void *timeout_ctx);
 static void ieee802_1x_kay_arm_deferred_rekey(struct ieee802_1x_kay *kay);
 static void ieee802_1x_kay_update_sak_use(
 	struct ieee802_1x_mka_participant *participant);
+static bool ieee802_1x_kay_sak_pending(struct ieee802_1x_kay *kay);
 
 
 /**
- * ieee802_1x_kay_set_principal_participant - Set the CP-owning participant
+ * ieee802_1x_kay_set_principal_participant - Select the negotiating CA
  *
  * The principal negotiates the port's next key without resetting the shared
  * CP phase. Carry the negotiated MACsec advisory until the next negotiation.
@@ -407,7 +408,7 @@ ieee802_1x_kay_set_principal_participant(
 	kay->principal_changed = true;
 	if (participant) {
 		wpa_printf(MSG_DEBUG,
-			   "KaY: principal participant (CP owner) set to CKN %s",
+			   "KaY: principal participant set to CKN %s",
 			   ckn_txt(&participant->ckn));
 	} else {
 		wpa_printf(MSG_DEBUG, "KaY: principal participant cleared");
@@ -478,7 +479,7 @@ ieee802_1x_kay_get_principal_participant(struct ieee802_1x_kay *kay)
 
 
 /**
- * ieee802_1x_kay_is_principal_participant - Is this the CP-owning participant?
+ * ieee802_1x_kay_is_principal_participant - May this CA negotiate port keys?
  */
 static bool
 ieee802_1x_kay_is_principal_participant(
@@ -486,23 +487,6 @@ ieee802_1x_kay_is_principal_participant(
 	const struct ieee802_1x_mka_participant *participant)
 {
 	return participant && kay->principal_participant == participant;
-}
-
-
-/**
- * ieee802_1x_kay_principal_or_self - Participant reporting SecY state
- *
- * SAK Use is present in every actor's MKPDUs once the shared SecY is using a
- * SAK. Only the principal actor encodes the shared key state; other actors
- * send a full-length SAK Use body with those fields clear (802.1X-2020 12.2).
- */
-static struct ieee802_1x_mka_participant *
-ieee802_1x_kay_principal_or_self(struct ieee802_1x_mka_participant *participant)
-{
-	struct ieee802_1x_mka_participant *owner =
-		ieee802_1x_kay_get_principal_participant(participant->kay);
-
-	return owner ? owner : participant;
 }
 
 
@@ -1478,7 +1462,7 @@ ieee802_1x_mka_get_sak_use_length(
 	int length = MKA_HDR_LEN;
 
 	if (participant->kay->macsec_desired &&
-	    ieee802_1x_kay_principal_or_self(participant)->advised_desired)
+	    participant->advised_desired)
 		length = sizeof(struct ieee802_1x_mka_sak_use_body);
 
 	return MKA_ALIGN_LENGTH(length);
@@ -1539,11 +1523,8 @@ ieee802_1x_mka_encode_sak_use_body(
 {
 	struct ieee802_1x_mka_sak_use_body *body;
 	struct ieee802_1x_kay *kay = participant->kay;
-	struct ieee802_1x_mka_participant *owner;
 	unsigned int length;
 	u64 olpn, llpn;
-
-	owner = ieee802_1x_kay_principal_or_self(participant);
 
 	length = ieee802_1x_mka_get_sak_use_length(participant);
 	body = wpabuf_put(buf, length);
@@ -1566,11 +1547,6 @@ ieee802_1x_mka_encode_sak_use_body(
 	body->ptx = !kay->macsec_protect;
 	body->prx = kay->macsec_validate != Strict;
 
-	/* The SAK Use parameter remains present on standby actors, but only the
-	 * principal actor reports the shared SecY's key state. */
-	if (participant != owner)
-		return 0;
-
 	/* data delay protect */
 	body->delay_protect = kay->mka_hello_time <= MKA_BOUNDED_HELLO_TIME;
 
@@ -1585,7 +1561,7 @@ ieee802_1x_mka_encode_sak_use_body(
 	body->llpn = host_to_be32(llpn);
 	/* Only the principal key server drives rekeying; a standby must never
 	 * request a new SAK. */
-	if (participant == owner && participant->is_key_server) {
+	if (participant->is_key_server) {
 		/* The CP will spend most of it's time in RETIRE where only
 		 * the old key is populated. Therefore we should be checking
 		 * the OLPN most of the time.
@@ -1704,12 +1680,6 @@ ieee802_1x_mka_decode_sak_use_body(
 		return 0;
 	}
 
-	peer->sa_an_mask = 0;
-	if (body->ltx || body->lrx)
-		peer->sa_an_mask |= BIT(body->lan);
-	if (body->otx || body->orx)
-		peer->sa_an_mask |= BIT(body->oan);
-
 	/* TODO: when the plain tx or rx of peer is true, should I change
 	 * the attribute of controlled port
 	 */
@@ -1729,8 +1699,7 @@ ieee802_1x_mka_decode_sak_use_body(
 	olpn = be_to_host32(body->olpn);
 	llpn = be_to_host32(body->llpn);
 
-	/* A standby actor can include SAK Use for liveness while leaving both
-	 * the latest and old key state clear. */
+	/* An actor can include an empty key-use report during convergence. */
 	if (!body->lrx && !body->ltx && !body->orx && !body->otx)
 		return 0;
 
@@ -1877,9 +1846,11 @@ static bool
 ieee802_1x_mka_dist_sak_body_present(
 	struct ieee802_1x_mka_participant *participant)
 {
-	return participant == ieee802_1x_kay_principal_or_self(participant) &&
+	return ieee802_1x_kay_is_principal_participant(participant->kay,
+						      participant) &&
 		participant->is_key_server && participant->to_dist_sak &&
 		participant->kay->new_key &&
+		!participant->kay->new_key->abandoned &&
 		!os_memcmp(participant->kay->new_key->key_identifier.mi,
 			   participant->mi, MI_LEN);
 }
@@ -1969,8 +1940,7 @@ ieee802_1x_mka_encode_dist_sak_body(
  */
 static void ieee802_1x_kay_init_data_key(struct data_key *pkey)
 {
-	pkey->transmits = true;
-	pkey->receives = true;
+	pkey->abandoned = false;
 	os_get_time(&pkey->created_time);
 
 	pkey->next_pn = 1;
@@ -2008,6 +1978,7 @@ ieee802_1x_mka_decode_dist_sak_body(
 	u8 *wrap_sak;
 	u8 *unwrap_sak;
 	struct ieee802_1x_kay *kay = participant->kay;
+	bool chgd_server;
 
 	hdr = (struct ieee802_1x_mka_hdr *) mka_msg;
 	body_len = get_mka_param_body_len(hdr);
@@ -2129,11 +2100,8 @@ ieee802_1x_mka_decode_dist_sak_body(
 		return -1;
 	}
 
-	/* SAK validated; everything below commits state and does not fail. */
-
-	/* Follow the key server: it distributes only on the CA it chose to own
-	 * the CP, so take ownership for this CA rather than deadlocking on a
-	 * keyless primary. Assumes a single key server drives the port. */
+	/* Follow the key server's negotiating CA, preserving the port-wide
+	 * key lifecycle. Assumes a single key server drives the port. */
 	if (!ieee802_1x_kay_is_principal_participant(kay, participant)) {
 		wpa_printf(MSG_INFO,
 			   "KaY: Following key server onto CKN %s for controlled-port ownership",
@@ -2141,12 +2109,27 @@ ieee802_1x_mka_decode_dist_sak_body(
 		ieee802_1x_kay_set_principal_participant(kay, participant);
 		ieee802_1x_kay_elect_key_server(participant, true);
 	}
+	participant->advised_desired = true;
+	chgd_server = !ieee802_1x_kay_sci_has_sas(kay, &peer->sci);
+	/* CP must consume a queued proposal before another can replace it. */
+	if ((ieee802_1x_kay_sak_pending(kay) &&
+	     (!chgd_server || !kay->new_key ||
+	      !is_ki_equal(&kay->new_key->key_identifier, &kay->lki))) ||
+	    (!chgd_server && kay->oki.kn && body->dan == kay->oan &&
+	     cs->id == kay->macsec_cs_id)) {
+		if (!ieee802_1x_kay_can_transmit_sak(kay, &kay->lki) &&
+		    ieee802_1x_kay_can_abandon_sak(kay))
+			ieee802_1x_cp_abandon_sak(kay->cp);
+		wpa_printf(MSG_DEBUG, "KaY: Defer SAK until an installed slot is released");
+		bin_clear_free(unwrap_sak, sak_len);
+		os_free(sa_key);
+		return 0;
+	}
 
 	kay->macsec_csindex = csindex;
 	if (body_len == 28)
 		kay->macsec_cs_id = cs->id;
 
-	participant->advised_desired = true;
 	kay->authenticated = false;
 	kay->secured = true;
 	kay->failed = false;
@@ -2178,7 +2161,7 @@ ieee802_1x_mka_decode_dist_sak_body(
 	ieee802_1x_cp_sm_step(kay->cp);
 	ieee802_1x_cp_set_offset(kay->cp, body->confid_offset);
 	ieee802_1x_cp_sm_step(kay->cp);
-	if (!ieee802_1x_kay_sci_has_sas(kay, &peer->sci))
+	if (chgd_server)
 		ieee802_1x_cp_signal_chgdserver(kay->cp);
 	kay->new_key = sa_key;
 	ieee802_1x_cp_set_distributedki(kay->cp, &sa_key->key_identifier);
@@ -2553,6 +2536,66 @@ bool ieee802_1x_kay_all_peers_transmitting(struct ieee802_1x_kay *kay,
 }
 
 
+bool ieee802_1x_kay_can_abandon_sak(struct ieee802_1x_kay *kay)
+{
+	bool rx, tx, all_tx;
+
+	if (kay->ltx || !ieee802_1x_kay_ki_is_set(&kay->lki) ||
+	    !ieee802_1x_kay_ki_is_set(&kay->oki) ||
+	    !ieee802_1x_kay_peer_key_use(kay, &kay->oki, kay->oan,
+					&rx, &tx, &all_tx) || !rx)
+		return false;
+	return ieee802_1x_kay_peer_key_use(kay, &kay->lki, kay->lan,
+					  &rx, &tx, &all_tx) && !tx;
+}
+
+
+static bool ieee802_1x_kay_sak_pending(struct ieee802_1x_kay *kay)
+{
+	return ieee802_1x_kay_ki_is_set(&kay->lki) ||
+		(kay->new_key &&
+		 !is_ki_equal(&kay->new_key->key_identifier, &kay->oki));
+}
+
+
+void ieee802_1x_kay_abandon_sak(struct ieee802_1x_kay *kay,
+			       const struct ieee802_1x_mka_ki *ki)
+{
+	struct data_key *key;
+	struct ieee802_1x_mka_participant *p;
+
+	dl_list_for_each(key, &kay->sak_list, struct data_key, list) {
+		if (!is_ki_equal(&key->key_identifier, ki))
+			continue;
+		key->abandoned = true;
+		dl_list_for_each(p, &kay->participant_list,
+				 struct ieee802_1x_mka_participant, list)
+			p->to_dist_sak = false;
+		p = kay->principal_participant;
+		if (p && p->is_key_server)
+			p->new_sak = true;
+		return;
+	}
+	wpa_printf(MSG_ERROR, "KaY: Cannot withdraw an unknown SAK");
+}
+
+
+void ieee802_1x_kay_rekey_failed(struct ieee802_1x_kay *kay)
+{
+	struct ieee802_1x_mka_participant *p = kay->principal_participant;
+
+	kay->failed = true;
+	kay->secured = false;
+	if (!p)
+		return;
+	p->to_dist_sak = false;
+	if (p->is_key_server)
+		p->new_sak = true;
+	else if (!reset_participant_mi(p))
+		wpa_printf(MSG_ERROR, "KaY: Could not restart failed SAK negotiation");
+}
+
+
 /* IEEE Std 802.1AE-2018, 9.6: the AN is two bits, so at most four SAs per SC. */
 #define MAX_AN 4
 
@@ -2578,11 +2621,14 @@ static unsigned int ieee802_1x_kay_an_count(const struct ieee802_1x_kay *kay)
  * key we have already released, so it is taken only when nothing else is free;
  * excluding it outright would let a peer that never converges block rekeying.
  */
-static u8 ieee802_1x_kay_select_dist_an(
+static int ieee802_1x_kay_select_dist_an(
 	struct ieee802_1x_mka_participant *participant)
 {
 	struct ieee802_1x_kay *kay = participant->kay;
 	struct ieee802_1x_kay_peer *peer;
+	struct transmit_sa *txsa;
+	struct receive_sc *rxsc;
+	struct receive_sa *rxsa;
 	unsigned int max = ieee802_1x_kay_an_count(kay);
 	/* A reduced-SA device forces itself key server (see kay_init), so our
 	 * own ANs are always within max. */
@@ -2602,9 +2648,27 @@ static u8 ieee802_1x_kay_select_dist_an(
 		next = kay->lan + 1;
 	}
 
+	if (kay->txsc) {
+		dl_list_for_each(txsa, &kay->txsc->sa_list, struct transmit_sa,
+				 list)
+			mine |= BIT(txsa->an);
+	}
+	dl_list_for_each(rxsc, &kay->rxsc_list, struct receive_sc, list) {
+		dl_list_for_each(rxsa, &rxsc->sa_list, struct receive_sa, list)
+			mine |= BIT(rxsa->an);
+	}
 	dl_list_for_each(peer, &participant->live_peers,
-			 struct ieee802_1x_kay_peer, list)
-		theirs |= peer->sa_an_mask;
+			 struct ieee802_1x_kay_peer, list) {
+		struct receive_sc *sc =
+			ieee802_1x_kay_find_receive_sc(kay, &peer->sci);
+
+		if (!sc || time(NULL) > sc->sak_use_expire)
+			continue;
+		for (i = 0; i < ARRAY_SIZE(sc->sak_ki); i++) {
+			if (sc->sak_rx[i] || sc->sak_tx[i])
+				theirs |= BIT(sc->sak_an[i]);
+		}
+	}
 
 	for (i = 0; i < max; i++) {
 		u8 an = (next + i) % max;
@@ -2617,13 +2681,7 @@ static u8 ieee802_1x_kay_select_dist_an(
 			fallback = an;
 	}
 
-	if (fallback >= 0)
-		return fallback;
-
-	/* No AN is free, so both SAKs are installed. The CP releases one before
-	 * installing the new SAK: it abandons the latest until we transmit on
-	 * it, and retires the old after. Take the one it will free. */
-	return kay->ltx ? kay->oan : kay->lan;
+	return fallback;
 }
 
 
@@ -2637,18 +2695,27 @@ ieee802_1x_kay_generate_new_sak(struct ieee802_1x_mka_participant *participant)
 	struct receive_sc *rxsc;
 	struct ieee802_1x_kay_peer *peer;
 	struct ieee802_1x_kay *kay = participant->kay;
-	int ctx_len, ctx_offset;
+	int ctx_len, ctx_offset, an;
 	u8 *context;
 	unsigned int key_len;
 	u8 *key;
 	struct macsec_ciphersuite *cs;
-	u8 an;
 
 	/* check condition for generating a fresh SAK:
 	 * must have one live peer
 	 * and MKA life time elapse since last distribution
 	 * or potential peer is empty
 	 */
+	if (ieee802_1x_kay_sak_pending(kay)) {
+		if (kay->new_key &&
+		    os_memcmp(kay->new_key->key_identifier.mi,
+			      participant->mi, MI_LEN) &&
+		    !ieee802_1x_kay_can_transmit_sak(kay, &kay->lki) &&
+		    ieee802_1x_kay_can_abandon_sak(kay))
+			ieee802_1x_cp_abandon_sak(kay->cp);
+		wpa_printf(MSG_DEBUG, "KaY: Wait for the in-flight SAK");
+		return -1;
+	}
 	if (dl_list_empty(&participant->live_peers)) {
 		wpa_printf(MSG_ERROR,
 			   "KaY: Live peers list must not be empty when generating fresh SAK");
@@ -2673,6 +2740,10 @@ ieee802_1x_kay_generate_new_sak(struct ieee802_1x_mka_participant *participant)
 	key_len = cs->sak_len;
 
 	an = ieee802_1x_kay_select_dist_an(participant);
+	if (an < 0) {
+		wpa_printf(MSG_DEBUG, "KaY: Wait for CP to release an AN");
+		return -1;
+	}
 
 	key = os_zalloc(key_len);
 	if (!key) {
@@ -2904,6 +2975,7 @@ ieee802_1x_kay_elect_key_server(struct ieee802_1x_mka_participant *participant,
 	if (i_is_key_server) {
 		participant->is_key_server = true;
 		participant->to_dist_sak = kay->new_key &&
+			!kay->new_key->abandoned &&
 			!is_ki_equal(&kay->new_key->key_identifier, &kay->oki) &&
 			!os_memcmp(kay->new_key->key_identifier.mi,
 				   participant->mi, MI_LEN);
@@ -3719,6 +3791,18 @@ int ieee802_1x_kay_create_sas(struct ieee802_1x_kay *kay,
 		wpa_printf(MSG_ERROR, "KaY: lki related sak not found");
 		return -1;
 	}
+	txsa = lookup_txsa_by_an(kay->txsc, latest_sak->an);
+	if (txsa && txsa->pkey != latest_sak) {
+		wpa_printf(MSG_ERROR, "KaY: Refusing to replace an occupied TX AN");
+		return -1;
+	}
+	dl_list_for_each(rxsc, &kay->rxsc_list, struct receive_sc, list) {
+		rxsa = lookup_rxsa_by_an(rxsc, latest_sak->an);
+		if (rxsa && rxsa->pkey != latest_sak) {
+			wpa_printf(MSG_ERROR, "KaY: Refusing to replace an occupied RX AN");
+			return -1;
+		}
+	}
 
 	cs = &cipher_suite_tbl[kay->macsec_csindex];
 	if (cs->is_xpn) {
@@ -3738,8 +3822,8 @@ int ieee802_1x_kay_create_sas(struct ieee802_1x_kay *kay,
 	}
 
 	dl_list_for_each(rxsc, &kay->rxsc_list, struct receive_sc, list) {
-		while ((rxsa = lookup_rxsa_by_an(rxsc, latest_sak->an)) != NULL)
-			ieee802_1x_delete_receive_sa(kay, rxsa);
+		if (lookup_rxsa_by_an(rxsc, latest_sak->an))
+			continue;
 
 		rxsa = ieee802_1x_kay_init_receive_sa(rxsc, latest_sak->an, 1,
 						      latest_sak);
@@ -3749,9 +3833,8 @@ int ieee802_1x_kay_create_sas(struct ieee802_1x_kay *kay,
 		secy_create_receive_sa(kay, rxsa);
 	}
 
-	while ((txsa = lookup_txsa_by_an(kay->txsc, latest_sak->an)) !=
-	       NULL)
-		ieee802_1x_delete_transmit_sa(kay, txsa);
+	if (lookup_txsa_by_an(kay->txsc, latest_sak->an))
+		return 0;
 
 	txsa = ieee802_1x_kay_init_transmit_sa(kay->txsc, latest_sak->an,
 					       latest_sak->next_pn ?
@@ -3829,21 +3912,26 @@ int ieee802_1x_kay_enable_tx_sas(struct ieee802_1x_kay *kay,
 	struct transmit_sa *txsa;
 
 	principal = ieee802_1x_kay_get_principal_participant(kay);
-	if (!principal)
+	if (!principal || !kay->txsc)
 		return -1;
 
 	dl_list_for_each(txsa, &kay->txsc->sa_list, struct transmit_sa,
 			 list) {
 		if (is_ki_equal(&txsa->pkey->key_identifier, lki)) {
+			if (secy_enable_transmit_sa(kay, txsa)) {
+				wpa_printf(MSG_ERROR, "KaY: Could not select TX SA");
+				return -1;
+			}
 			txsa->in_use = true;
-			secy_enable_transmit_sa(kay, txsa);
 			ieee802_1x_cp_set_usingtransmitas(
 				principal->kay->cp, true);
 			ieee802_1x_cp_sm_step(principal->kay->cp);
+			return 0;
 		}
 	}
 
-	return 0;
+	wpa_printf(MSG_ERROR, "KaY: Requested TX SA is not installed");
+	return -1;
 }
 
 
@@ -4101,6 +4189,11 @@ ieee802_1x_kay_update_sak_use(struct ieee802_1x_mka_participant *p)
 		}
 	}
 	ieee802_1x_cp_set_servertransmitting(kay->cp, server_tx);
+	if (p->is_key_server && kay->new_key &&
+	    os_memcmp(kay->new_key->key_identifier.mi, p->mi, MI_LEN) &&
+	    !ieee802_1x_kay_can_transmit_sak(kay, ki) &&
+	    ieee802_1x_kay_can_abandon_sak(kay))
+		ieee802_1x_cp_abandon_sak(kay->cp);
 	ieee802_1x_cp_sm_step(kay->cp);
 }
 

@@ -81,6 +81,7 @@ struct ieee802_1x_cp_sm {
 	u32 transmit_delay;
 	u32 retire_when;
 	u32 retire_delay;
+	bool tx_selection_started;
 
 	/* not defined IEEE Std 802.1X-2010 */
 	struct ieee802_1x_kay *kay;
@@ -90,6 +91,40 @@ static void ieee802_1x_cp_retire_when_timeout(void *eloop_ctx,
 					      void *timeout_ctx);
 static void ieee802_1x_cp_transmit_when_timeout(void *eloop_ctx,
 						void *timeout_ctx);
+
+static void ieee802_1x_cp_cancel_rollover(struct ieee802_1x_cp_sm *sm)
+{
+	eloop_cancel_timeout(ieee802_1x_cp_transmit_when_timeout, sm, NULL);
+	eloop_cancel_timeout(ieee802_1x_cp_retire_when_timeout, sm, NULL);
+}
+
+
+static void ieee802_1x_cp_clear_latest(struct ieee802_1x_cp_sm *sm)
+{
+	if (sm->lki)
+		ieee802_1x_kay_delete_sas(sm->kay, sm->lki);
+	os_free(sm->lki);
+	sm->lki = NULL;
+	sm->ltx = sm->lrx = false;
+	sm->tx_selection_started = false;
+	sm->lan = 0;
+	ieee802_1x_kay_set_latest_sa_attr(sm->kay, NULL, 0, false, false);
+}
+
+
+static int ieee802_1x_cp_select_latest(struct ieee802_1x_cp_sm *sm)
+{
+	if (!ieee802_1x_kay_can_transmit_sak(sm->kay, sm->lki))
+		return -1;
+	/* Selection may be queued even when the completion callback fails. */
+	sm->tx_selection_started = true;
+	if (ieee802_1x_kay_enable_tx_sas(sm->kay, sm->lki))
+		return -1;
+	sm->ltx = true;
+	ieee802_1x_kay_set_latest_sa_attr(sm->kay, sm->lki, sm->lan,
+					  sm->ltx, sm->lrx);
+	return 0;
+}
 
 
 static int changed_cipher(struct ieee802_1x_cp_sm *sm)
@@ -108,6 +143,7 @@ static int changed_connect(struct ieee802_1x_cp_sm *sm)
 SM_STATE(CP, INIT)
 {
 	SM_ENTRY(CP, INIT);
+	ieee802_1x_cp_cancel_rollover(sm);
 
 	sm->controlled_port_enabled = false;
 	secy_cp_control_enable_port(sm->kay, sm->controlled_port_enabled);
@@ -118,6 +154,7 @@ SM_STATE(CP, INIT)
 	sm->lki = NULL;
 	sm->ltx = false;
 	sm->lrx = false;
+	sm->tx_selection_started = false;
 
 	os_free(sm->oki);
 	sm->oki = NULL;
@@ -132,13 +169,12 @@ SM_STATE(CP, INIT)
 SM_STATE(CP, CHANGE)
 {
 	SM_ENTRY(CP, CHANGE);
+	ieee802_1x_cp_cancel_rollover(sm);
 
 	sm->port_valid = false;
 	sm->controlled_port_enabled = false;
 	secy_cp_control_enable_port(sm->kay, sm->controlled_port_enabled);
 
-	if (sm->lki)
-		ieee802_1x_kay_delete_sas(sm->kay, sm->lki);
 	if (sm->oki)
 		ieee802_1x_kay_delete_sas(sm->kay, sm->oki);
 	/* The standard doesn't say it but we should clear out the latest
@@ -152,13 +188,8 @@ SM_STATE(CP, CHANGE)
 	sm->oan = 0;
 	ieee802_1x_kay_set_old_sa_attr(sm->kay, sm->oki, sm->oan,
 				       sm->otx, sm->orx);
-	os_free(sm->lki);
-	sm->lki = NULL;
-	sm->lrx = false;
-	sm->ltx = false;
-	sm->lan = 0;
-	ieee802_1x_kay_set_latest_sa_attr(sm->kay, sm->lki, sm->lan,
-					  sm->ltx, sm->lrx);
+	ieee802_1x_cp_clear_latest(sm);
+	sm->using_receive_sas = sm->using_transmit_sa = false;
 }
 
 
@@ -239,13 +270,19 @@ SM_STATE(CP, RECEIVE)
 	sm->lan = sm->distributed_an;
 	sm->ltx = false;
 	sm->lrx = false;
+	sm->tx_selection_started = false;
 	ieee802_1x_kay_set_latest_sa_attr(sm->kay, sm->lki, sm->lan,
 					  sm->ltx, sm->lrx);
-	ieee802_1x_kay_create_sas(sm->kay, sm->lki);
-	ieee802_1x_kay_enable_rx_sas(sm->kay, sm->lki);
 	sm->new_sak = false;
 	sm->all_receiving = false;
 	sm->all_transmitting = false;
+	sm->using_receive_sas = sm->using_transmit_sa = false;
+	if (ieee802_1x_kay_create_sas(sm->kay, sm->lki)) {
+		wpa_printf(MSG_ERROR, "CP: Could not install candidate SAs");
+		ieee802_1x_cp_abandon_sak(sm);
+		return;
+	}
+	ieee802_1x_kay_enable_rx_sas(sm->kay, sm->lki);
 }
 
 
@@ -283,10 +320,15 @@ SM_STATE(CP, TRANSMIT)
 
 	sm->controlled_port_enabled = true;
 	secy_cp_control_enable_port(sm->kay, sm->controlled_port_enabled);
-	sm->ltx = true;
-	ieee802_1x_kay_set_latest_sa_attr(sm->kay, sm->lki, sm->lan,
-					  sm->ltx, sm->lrx);
-	ieee802_1x_kay_enable_tx_sas(sm->kay,  sm->lki);
+	sm->transmit_when = MKA_SAK_RETIRE_FAILSAFE_TIME;
+	eloop_cancel_timeout(ieee802_1x_cp_transmit_when_timeout, sm, NULL);
+	if (eloop_register_timeout(sm->transmit_when / 1000, 0,
+				   ieee802_1x_cp_transmit_when_timeout, sm, NULL)) {
+		wpa_printf(MSG_ERROR, "CP: Could not arm TX selection timeout");
+		sm->transmit_when = 0;
+	}
+	if (ieee802_1x_cp_select_latest(sm) && !sm->tx_selection_started)
+		SM_ENTER(CP, RECEIVING);
 	sm->all_receiving = false;
 	sm->all_transmitting = false;
 	sm->server_transmitting = false;
@@ -296,6 +338,7 @@ SM_STATE(CP, TRANSMIT)
 SM_STATE(CP, TRANSMITTING)
 {
 	SM_ENTRY(CP, TRANSMITTING);
+	eloop_cancel_timeout(ieee802_1x_cp_transmit_when_timeout, sm, NULL);
 	/* Both roles retain old RX until exact peer TX confirmation. */
 	sm->retire_when = sm->orx ? MKA_SAK_RETIRE_FAILSAFE_TIME : 0;
 	sm->otx = false;
@@ -308,6 +351,7 @@ SM_STATE(CP, TRANSMITTING)
 				   ieee802_1x_cp_retire_when_timeout, sm, NULL)) {
 		wpa_printf(MSG_ERROR, "CP: Could not arm peer TX confirmation timeout");
 		SM_ENTER(CP, CHANGE);
+		ieee802_1x_kay_rekey_failed(sm->kay);
 	}
 	sm->using_transmit_sa = false;
 }
@@ -316,25 +360,32 @@ SM_STATE(CP, TRANSMITTING)
 SM_STATE(CP, ABANDON)
 {
 	SM_ENTRY(CP, ABANDON);
-	/* enable_tx_sas() only ever sets usingTransmitSA; clear it here so a
-	 * stale value cannot drive TRANSMIT -> TRANSMITTING before the new
-	 * transmit SA is installed. */
+	ieee802_1x_cp_cancel_rollover(sm);
+	ieee802_1x_kay_abandon_sak(sm->kay, sm->lki);
 	sm->using_transmit_sa = false;
-	sm->lrx = false;
+	sm->all_receiving = sm->all_transmitting = false;
+	sm->server_transmitting = false;
+	sm->ltx = false;
 	ieee802_1x_kay_set_latest_sa_attr(sm->kay, sm->lki, sm->lan,
 					  sm->ltx, sm->lrx);
-	ieee802_1x_kay_delete_sas(sm->kay, sm->lki);
-
-	os_free(sm->lki);
-	sm->lki = NULL;
-	ieee802_1x_kay_set_latest_sa_attr(sm->kay, sm->lki, sm->lan,
-					  sm->ltx, sm->lrx);
+	/* Drain candidate RX before deletion; unknown commitment is bounded. */
+	sm->retire_when = sm->retire_delay;
+	sm->transmit_when = MKA_SAK_RETIRE_FAILSAFE_TIME;
+	if (eloop_register_timeout(sm->retire_when / 1000, 0,
+				   ieee802_1x_cp_retire_when_timeout, sm, NULL) ||
+	    eloop_register_timeout(sm->transmit_when / 1000, 0,
+				   ieee802_1x_cp_transmit_when_timeout, sm, NULL)) {
+		wpa_printf(MSG_ERROR, "CP: Could not arm SAK recovery timers");
+		sm->transmit_when = 0;
+	}
+	ieee802_1x_kay_enable_new_info(sm->kay);
 }
 
 
 SM_STATE(CP, RETIRE)
 {
 	SM_ENTRY(CP, RETIRE);
+	ieee802_1x_cp_cancel_rollover(sm);
 	if (sm->oki) {
 		ieee802_1x_kay_delete_sas(sm->kay, sm->oki);
 		os_free(sm->oki);
@@ -349,6 +400,7 @@ SM_STATE(CP, RETIRE)
 	sm->lki = NULL;
 	sm->ltx = false;
 	sm->lrx = false;
+	sm->tx_selection_started = false;
 	sm->lan = 0;
 	ieee802_1x_kay_set_latest_sa_attr(sm->kay, sm->lki, sm->lan,
 					  sm->ltx, sm->lrx);
@@ -404,22 +456,29 @@ SM_STEP(CP)
 		break;
 
 	case CP_RECEIVING:
-		if (sm->new_sak || changed_connect(sm))
-			SM_ENTER(CP, ABANDON);
+		if (changed_connect(sm))
+			SM_ENTER(CP, CHANGE);
+		else if (sm->new_sak)
+			ieee802_1x_cp_abandon_sak(sm);
 		else if (!sm->elected_self)
 			SM_ENTER(CP, READY);
 		else if (ieee802_1x_kay_can_transmit_sak(sm->kay, sm->lki))
 			SM_ENTER(CP, TRANSMIT);
+		else if (!sm->transmit_when &&
+			 ieee802_1x_kay_can_abandon_sak(sm->kay))
+			ieee802_1x_cp_abandon_sak(sm);
 		break;
 
 	case CP_TRANSMIT:
-		/* Escape on new SAK or connectivity change so the CP cannot
-		 * wedge here when usingTransmitSA never asserts. Mirrors
-		 * CP_RECEIVING / CP_READY. */
-		if (sm->new_sak || changed_connect(sm))
-			SM_ENTER(CP, ABANDON);
+		if (changed_connect(sm))
+			SM_ENTER(CP, CHANGE);
 		else if (sm->using_transmit_sa)
 			SM_ENTER(CP, TRANSMITTING);
+		else if (!sm->transmit_when) {
+			wpa_printf(MSG_ERROR, "CP: TX selection did not complete");
+			SM_ENTER(CP, CHANGE);
+			ieee802_1x_kay_rekey_failed(sm->kay);
+		}
 		break;
 
 	case CP_TRANSMITTING:
@@ -442,16 +501,35 @@ SM_STEP(CP)
 		break;
 
 	case CP_READY:
-		if (sm->new_sak || changed_connect(sm))
-			SM_ENTER(CP, ABANDON);
+		if (changed_connect(sm))
+			SM_ENTER(CP, CHANGE);
+		else if (sm->new_sak)
+			ieee802_1x_cp_abandon_sak(sm);
 		else if ((sm->elected_self || sm->server_transmitting) &&
 			 ieee802_1x_kay_can_transmit_sak(sm->kay, sm->lki))
 			SM_ENTER(CP, TRANSMIT);
+		else if (sm->elected_self && !sm->transmit_when &&
+			 ieee802_1x_kay_can_abandon_sak(sm->kay))
+			ieee802_1x_cp_abandon_sak(sm);
 		break;
 	case CP_ABANDON:
 		if (changed_connect(sm))
-			SM_ENTER(CP, RETIRE);
-		else if (sm->new_sak)
+			SM_ENTER(CP, CHANGE);
+		else if (sm->lki) {
+			if (sm->all_receiving && sm->all_transmitting &&
+			    ieee802_1x_kay_can_transmit_sak(sm->kay, sm->lki)) {
+				SM_ENTER(CP, TRANSMIT);
+			} else if (!sm->retire_when &&
+				   ieee802_1x_kay_can_abandon_sak(sm->kay)) {
+				ieee802_1x_cp_cancel_rollover(sm);
+				ieee802_1x_cp_clear_latest(sm);
+				ieee802_1x_kay_enable_new_info(sm->kay);
+			} else if (!sm->transmit_when) {
+				wpa_printf(MSG_ERROR, "CP: SAK recovery did not converge");
+				SM_ENTER(CP, CHANGE);
+				ieee802_1x_kay_rekey_failed(sm->kay);
+			}
+		} else if (sm->new_sak)
 			SM_ENTER(CP, RECEIVE);
 		break;
 	default:
@@ -550,8 +628,7 @@ void ieee802_1x_cp_sm_deinit(struct ieee802_1x_cp_sm *sm)
 	if (!sm)
 		return;
 
-	eloop_cancel_timeout(ieee802_1x_cp_retire_when_timeout, sm, NULL);
-	eloop_cancel_timeout(ieee802_1x_cp_transmit_when_timeout, sm, NULL);
+	ieee802_1x_cp_cancel_rollover(sm);
 	eloop_cancel_timeout(ieee802_1x_cp_step_cb, sm, NULL);
 	os_free(sm->lki);
 	os_free(sm->oki);
@@ -715,19 +792,21 @@ void ieee802_1x_cp_set_usingtransmitas(void *cp_ctx, bool status)
 }
 
 
-void ieee802_1x_cp_abandon_latest_sak(void *cp_ctx)
+int ieee802_1x_cp_abandon_sak(void *cp_ctx)
 {
 	struct ieee802_1x_cp_sm *sm = cp_ctx;
 
-	if ((sm->CP_state == CP_RECEIVE ||
-	     sm->CP_state == CP_RECEIVING) &&
-	    sm->lki && !sm->ltx && sm->oki && sm->otx) {
-		/* Keep the old SAK active if a peer missed DistSAK on CA change. */
-		eloop_cancel_timeout(ieee802_1x_cp_transmit_when_timeout,
-				     sm, NULL);
-		SM_ENTER(CP, ABANDON);
-		ieee802_1x_cp_sm_step(sm);
+	if (sm->CP_state == CP_ABANDON)
+		return 0;
+	if (!sm->lki)
+		return -1;
+	if (sm->ltx || sm->tx_selection_started) {
+		wpa_printf(MSG_DEBUG, "CP: Cannot abandon a started TX selection");
+		return -1;
 	}
+	SM_ENTER(CP, ABANDON);
+	ieee802_1x_cp_sm_step(sm);
+	return 0;
 }
 
 

@@ -52,8 +52,6 @@ struct ieee802_1x_kay_peer {
 	u8 key_server_priority;
 	bool macsec_desired;
 	enum macsec_cap macsec_capability;
-	/* ANs the peer last reported an SA on. */
-	u8 sa_an_mask;
 	struct dl_list list;
 };
 

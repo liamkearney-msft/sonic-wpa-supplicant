@@ -68,8 +68,7 @@ struct data_key {
 	struct ieee802_1x_mka_ki key_identifier;
 	enum confidentiality_offset confidentiality_offset;
 	u8 an;
-	bool transmits;
-	bool receives;
+	bool abandoned;
 	struct os_time created_time;
 	u64 next_pn;
 	u8 salt[SALT_LEN];
@@ -335,6 +334,10 @@ bool ieee802_1x_kay_can_transmit_sak(struct ieee802_1x_kay *kay,
 				   const struct ieee802_1x_mka_ki *ki);
 bool ieee802_1x_kay_all_peers_transmitting(struct ieee802_1x_kay *kay,
 					   const struct ieee802_1x_mka_ki *ki);
+bool ieee802_1x_kay_can_abandon_sak(struct ieee802_1x_kay *kay);
+void ieee802_1x_kay_abandon_sak(struct ieee802_1x_kay *kay,
+			       const struct ieee802_1x_mka_ki *ki);
+void ieee802_1x_kay_rekey_failed(struct ieee802_1x_kay *kay);
 int ieee802_1x_kay_get_status(struct ieee802_1x_kay *kay, char *buf,
 			      size_t buflen);
 int ieee802_1x_kay_get_macsec(struct ieee802_1x_kay *kay, char *buf,
